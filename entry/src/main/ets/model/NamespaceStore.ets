@@ -70,17 +70,64 @@ export class NamespaceStore {
       relationalStore.ConflictResolution.ON_CONFLICT_REPLACE);
   }
 
-  /** 批量 upsert 节点（单事务，失败整体回滚） */
-  async upsertNodes(nodes: NamespaceNode[]): Promise<void> {
+  /**
+   * 应用增量变更（P0-1）：墓碑节点（deleted=true）本地删除，其余 upsert；
+   * 游标单调推进——newVersion < 已同步版本时拒绝推进（游标回退保护）。
+   * 目录墓碑的级联由服务端负责（tombstone 协议语义：控制面级联下发全部受影响节点）。
+   */
+  async applyChanges(nodes: NamespaceNode[], newVersion: number): Promise<void> {
     if (this.store === undefined) {
       throw new Error('NamespaceStore not initialized');
     }
-    if (nodes.length === 0) {
-      return;
-    }
+    const current = await this.getSyncedVersion();
+    const advance = newVersion >= current;
     this.store.beginTransaction();
     try {
       for (const n of nodes) {
+        if (n.deleted === true) {
+          await this.store.executeSql(`DELETE FROM ${TABLE} WHERE id = ?`, [n.id]);
+        } else {
+          const vb: relationalStore.ValuesBucket = {
+            'id': n.id,
+            'parentId': n.parentId,
+            'name': n.name,
+            'type': n.type,
+            'size': n.size,
+            'mtime': n.mtime,
+            'version': n.version,
+          };
+          await this.store.insert(TABLE, vb,
+            relationalStore.ConflictResolution.ON_CONFLICT_REPLACE);
+        }
+      }
+      if (advance) {
+        const vb2: relationalStore.ValuesBucket =
+          { 'k': KEY_SYNC_VERSION, 'v': String(newVersion) };
+        await this.store.insert(META_TABLE, vb2,
+          relationalStore.ConflictResolution.ON_CONFLICT_REPLACE);
+      }
+      this.store.commit();
+    } catch (e) {
+      this.store.rollBack();
+      throw new Error(`applyChanges failed: ${e}`);
+    }
+  }
+
+  /**
+   * 全量重置（P0-1：服务端版本回退时用）：清空节点表 + 全量 upsert + 游标回退重写。
+   * 单事务保证原子性——要么全部生效，要么保持旧状态。
+   */
+  async resetAll(nodes: NamespaceNode[], newVersion: number): Promise<void> {
+    if (this.store === undefined) {
+      throw new Error('NamespaceStore not initialized');
+    }
+    this.store.beginTransaction();
+    try {
+      await this.store.executeSql(`DELETE FROM ${TABLE}`);
+      for (const n of nodes) {
+        if (n.deleted === true) {
+          continue; // 全量重拉只应含活节点，防御性跳过墓碑
+        }
         const vb: relationalStore.ValuesBucket = {
           'id': n.id,
           'parentId': n.parentId,
@@ -93,10 +140,14 @@ export class NamespaceStore {
         await this.store.insert(TABLE, vb,
           relationalStore.ConflictResolution.ON_CONFLICT_REPLACE);
       }
+      const vb2: relationalStore.ValuesBucket =
+        { 'k': KEY_SYNC_VERSION, 'v': String(newVersion) };
+      await this.store.insert(META_TABLE, vb2,
+        relationalStore.ConflictResolution.ON_CONFLICT_REPLACE);
       this.store.commit();
     } catch (e) {
       this.store.rollBack();
-      throw new Error(`upsertNodes failed: ${e}`);
+      throw new Error(`resetAll failed: ${e}`);
     }
   }
 

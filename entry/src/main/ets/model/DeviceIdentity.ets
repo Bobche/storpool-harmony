@@ -58,4 +58,14 @@ export class DeviceIdentity {
     this.prefs.putSync(KEY_DEVICE_NAME, deviceName);
     await this.prefs.flush();
   }
+
+  /** 清除设备身份（P0-2：401 自愈用）。保留 deviceName 供重注册复用。 */
+  async clear(): Promise<void> {
+    if (this.prefs === undefined) {
+      throw new Error('DeviceIdentity not loaded');
+    }
+    this.prefs.deleteSync(KEY_DEVICE_ID);
+    this.prefs.deleteSync(KEY_DEVICE_TOKEN);
+    await this.prefs.flush();
+  }
 }

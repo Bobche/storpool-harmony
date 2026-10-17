@@ -1,5 +1,5 @@
 import { bridgeVersion, ping, encodeHello, decodeHello, HelloInfo } from '../model/StorPoolNapi';
-import { ControlPlaneClient, RegisterResponse, HeartbeatResponse } from '../net/ControlPlaneClient';
+import { ControlPlaneClient, RegisterResponse, HeartbeatResponse, HttpError } from '../net/ControlPlaneClient';
 import { DeviceIdentity } from '../model/DeviceIdentity';
 import { NamespaceBrowser } from '../components/NamespaceBrowser';
 import { common } from '@kit.AbilityKit';
@@ -57,6 +57,8 @@ struct Index {
   // 非状态成员
   private identity: DeviceIdentity = new DeviceIdentity();
   private hbTimer: number = -1;
+  // P0-2：401 自愈冷却（重注册成功前连续 401 时防重注册风暴）
+  private lastSelfHealAt: number = 0;
 
   // ================= H0b：NAPI 检查 =================
 
@@ -199,8 +201,33 @@ struct Index {
         this.hbStatus = `心跳异常: status=${resp.status}`;
       }
     } catch (e) {
-      this.hbStatus = `心跳失败: ${e}`;
+      if (e instanceof HttpError && e.statusCode === 401) {
+        // P0-2：token/身份失效自愈（mock 重启内存丢失、服务端重置均会 401）
+        this.selfHeal('heartbeat');
+      } else {
+        this.hbStatus = `心跳失败: ${e}`;
+      }
     }
+  }
+
+  /**
+   * P0-2：401 自愈——清身份 → 重新注册 → 恢复心跳。
+   * 30s 冷却：重注册成功前若连续 401，只写状态不再触发，避免重注册风暴。
+   */
+  async selfHeal(source: string): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastSelfHealAt < 30000) {
+      this.hbStatus = `身份失效（401，${source}），自愈冷却中（30s）`;
+      return;
+    }
+    this.lastSelfHealAt = now;
+    this.hbStatus = '身份失效（401）→ 清身份 → 自动重注册…';
+    try {
+      await this.identity.clear();
+    } catch (err) {
+      // 未加载/清除失败不阻塞重注册路径
+    }
+    this.reRegister();
   }
 
   // ================= H3：后台保活 =================
@@ -383,6 +410,9 @@ struct Index {
           ctrlUrl: this.ctrlUrl,
           deviceToken: this.deviceToken,
           registered: this.regOk,
+          onAuthLost: (): void => {
+            this.selfHeal('namespace');
+          },
         })
 
         // ---------- 区块四：H3 后台保活 ----------

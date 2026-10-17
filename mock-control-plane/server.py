@@ -5,7 +5,15 @@
   POST /devices/register   {deviceName, platform}          -> {deviceId, deviceToken, serverTime}
   POST /devices/heartbeat  {deviceId} (Bearer deviceToken) -> {status, serverTime}
   GET  /devices            -> 全量设备快照（联调观测用）
-  GET  /namespace[?since=N] (Bearer deviceToken)           -> {version, nodes}  H2 元数据
+  GET  /namespace[?since=N] (Bearer deviceToken)           -> {version, mode, nodes}  H2 元数据
+  POST /admin/namespace/delete   {id}                      -> 节点墓碑（级联子树）+ 版本推进（P0-1 删除语义用例）
+  POST /admin/namespace/rollback {version}                 -> 服务端版本回退（模拟重置，P0-1 游标保护用例）
+
+P0-1 协议语义（Go 控制面对齐基线）：
+  - 删除：tombstone 模式——节点标记 deleted=true 并推进全局版本；增量拉取(version>since)
+    携带墓碑，客户端负责本地删除；全量拉取只返回活节点（重拉无需墓碑）。
+  - 版本回退：客户端须校验 resp.version >= 已同步游标，回退时清库全量重拉，
+    禁止直接把游标写回退值（否则数据永久陈旧且无重拉触发）。
 
 用法：python server.py [port]   （默认 8765）
 """
@@ -28,6 +36,7 @@ def now_ms() -> int:
 
 # ---------------- H2：虚拟目录树（种子数据） ----------------
 # 节点结构：id / parentId / name / type(dir|file) / size(字节) / mtime / version
+#           / deleted(可选，tombstone 标记)
 # version 单调递增；增量拉取 = version > since 的节点
 NAMESPACE_VERSION = 3
 _T0 = 1792200000000
@@ -48,8 +57,49 @@ NAMESPACE_NODES: list = [
 ]
 
 
+def tombstone_node(node_id: int) -> dict | None:
+    """P0-1a：节点墓碑（级联子树，parentId 链 BFS 收集后代）。
+
+    推进全局版本一次，所有受影响节点绑定同一版本，确保一次增量拉取全部命中。
+    """
+    global NAMESPACE_VERSION
+    with LOCK:
+        target = next((n for n in NAMESPACE_NODES if n['id'] == node_id), None)
+        if target is None:
+            return None
+        affected = [target]
+        affected_ids = {target['id']}
+        frontier = [target['id']]
+        while frontier:
+            pid = frontier.pop()
+            for n in NAMESPACE_NODES:
+                if (n['parentId'] == pid and n['id'] not in affected_ids
+                        and not n.get('deleted')):
+                    affected.append(n)
+                    affected_ids.add(n['id'])
+                    frontier.append(n['id'])
+        NAMESPACE_VERSION += 1
+        for n in affected:
+            n['deleted'] = True
+            n['version'] = NAMESPACE_VERSION
+            n['mtime'] = now_ms()
+        return {'version': NAMESPACE_VERSION, 'tombstoned': sorted(affected_ids)}
+
+
+def rollback_namespace(target_version: int) -> dict:
+    """P0-1b：服务端版本回退（模拟重置/降级后全局版本倒退）。
+
+    客户端下次增量拉取将看到 resp.version < since，须触发全量重拉。
+    """
+    global NAMESPACE_VERSION
+    with LOCK:
+        previous = NAMESPACE_VERSION
+        NAMESPACE_VERSION = target_version
+        return {'version': NAMESPACE_VERSION, 'previous': previous}
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'StorPoolMockCP/0.1'
+    server_version = 'StorPoolMockCP/0.2'
 
     def _json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode('utf-8')
@@ -116,6 +166,25 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {'status': 'ok', 'serverTime': now_ms()})
             return
 
+        if self.path == '/admin/namespace/delete':
+            node_id = int(payload.get('id', 0))
+            result = tombstone_node(node_id)
+            if result is None:
+                self._json(404, {'error': f'node {node_id} not found',
+                                 'serverTime': now_ms()})
+                return
+            print(f'[admin] tombstone node {node_id} -> {result}')
+            self._json(200, {'ok': True, 'serverTime': now_ms(), **result})
+            return
+
+        if self.path == '/admin/namespace/rollback':
+            target_version = int(payload.get('version', 0))
+            result = rollback_namespace(target_version)
+            print(f'[admin] rollback namespace version '
+                  f'{result["previous"]} -> {result["version"]}')
+            self._json(200, {'ok': True, 'serverTime': now_ms(), **result})
+            return
+
         self._json(404, {'error': 'not found'})
 
     def do_GET(self) -> None:  # noqa: N802
@@ -143,9 +212,11 @@ class Handler(BaseHTTPRequestHandler):
             since = int(qs.get('since', ['0'])[0])
             with LOCK:
                 if since <= 0:
-                    nodes = [dict(n) for n in NAMESPACE_NODES]
+                    # 全量只返回活节点（重拉不需要墓碑）
+                    nodes = [dict(n) for n in NAMESPACE_NODES if not n.get('deleted')]
                     mode = 'full'
                 else:
+                    # 增量返回活节点 + 墓碑（deleted=true），客户端负责本地删除
                     nodes = [dict(n) for n in NAMESPACE_NODES if n['version'] > since]
                     mode = 'incremental'
                 version = NAMESPACE_VERSION
@@ -154,8 +225,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {'version': version, 'mode': mode, 'nodes': nodes})
             return
         if parsed.path == '/health':
+            with LOCK:
+                tombs = sum(1 for n in NAMESPACE_NODES if n.get('deleted'))
             self._json(200, {'status': 'ok', 'devices': len(DEVICES),
-                             'namespaceVersion': NAMESPACE_VERSION})
+                             'namespaceVersion': NAMESPACE_VERSION,
+                             'tombstones': tombs})
             return
         self._json(404, {'error': 'not found'})
 
@@ -168,7 +242,8 @@ def main() -> None:
     server = ThreadingHTTPServer(('0.0.0.0', port), Handler)
     print(f'StorPool mock control plane listening on 0.0.0.0:{port}')
     print('endpoints: POST /devices/register | POST /devices/heartbeat | '
-          'GET /devices | GET /namespace[?since=N] | GET /health')
+          'GET /devices | GET /namespace[?since=N] | GET /health | '
+          'POST /admin/namespace/delete | POST /admin/namespace/rollback')
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -1,13 +1,15 @@
 import { http } from '@kit.NetworkKit';
 
 /**
- * 控制面 HTTP 客户端（H1）
+ * 控制面 HTTP 客户端（H1/H2）
  *
  * 对接控制面 API（H1 阶段为 mock：mock-control-plane/server.py）：
  *   POST /devices/register   {deviceName, platform}          -> {deviceId, deviceToken, serverTime}
  *   POST /devices/heartbeat  {deviceId} (Bearer deviceToken) -> {status, serverTime}
+ *   GET  /namespace?since=N  (Bearer deviceToken)            -> {version, mode, nodes}
  *
  * 鉴权：H1 用 Bearer token 简化；正式 mTLS 双向证书在控制面 Go 侧就绪后升级。
+ * 错误：非 200 抛 HttpError（携带 statusCode，供调用方判定 401 自愈，P0-2）。
  */
 export interface RegisterResponse {
   deviceId: string;
@@ -30,6 +32,19 @@ export interface HeartbeatRequest {
   deviceId: string;
 }
 
+/** HTTP 错误（P0-2：携带状态码，供 401 自愈判定） */
+export class HttpError extends Error {
+  readonly statusCode: number;
+  readonly path: string;
+
+  constructor(statusCode: number, path: string) {
+    super(`HTTP ${statusCode} ${path}`);
+    this.name = 'HttpError';
+    this.statusCode = statusCode;
+    this.path = path;
+  }
+}
+
 /** H2：虚拟目录树节点（控制面下发） */
 export interface NamespaceNode {
   id: number;
@@ -39,11 +54,12 @@ export interface NamespaceNode {
   size: number;      // 字节
   mtime: number;     // 毫秒时间戳
   version: number;   // 节点版本（单调递增）
+  deleted?: boolean; // P0-1：tombstone 标记（增量拉取携带，客户端本地删除）
 }
 
 export interface NamespaceResponse {
   version: number;   // namespace 全局版本（增量游标）
-  mode: string;      // 'full' | 'incremental'
+  mode: string;      // 'full' | 'incremental'（增量可能含墓碑节点）
   nodes: NamespaceNode[];
 }
 
@@ -72,7 +88,7 @@ export class ControlPlaneClient {
         readTimeout: TIMEOUT_MS,
       });
       if (resp.responseCode !== 200) {
-        throw new Error(`HTTP ${resp.responseCode} ${path}`);
+        throw new HttpError(resp.responseCode, path);
       }
       return resp.result as object;
     } finally {
@@ -96,7 +112,7 @@ export class ControlPlaneClient {
     return r as HeartbeatResponse;
   }
 
-  /** H2：拉取虚拟目录树（since=0 全量；否则返回 version>since 的增量节点） */
+  /** H2：拉取虚拟目录树（since=0 全量只含活节点；增量含墓碑，version>since） */
   async fetchNamespace(deviceToken: string, since: number): Promise<NamespaceResponse> {
     const client: http.HttpRequest = http.createHttp();
     try {
@@ -110,7 +126,7 @@ export class ControlPlaneClient {
         readTimeout: TIMEOUT_MS,
       });
       if (resp.responseCode !== 200) {
-        throw new Error(`HTTP ${resp.responseCode} /namespace`);
+        throw new HttpError(resp.responseCode, '/namespace');
       }
       return resp.result as NamespaceResponse;
     } finally {

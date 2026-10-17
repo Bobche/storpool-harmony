@@ -1,6 +1,5 @@
-import { NamespaceNode } from '../net/ControlPlaneClient';
+import { NamespaceNode, ControlPlaneClient, NamespaceResponse, HttpError } from '../net/ControlPlaneClient';
 import { NamespaceStore, NamespaceStat } from '../model/NamespaceStore';
-import { ControlPlaneClient, NamespaceResponse } from '../net/ControlPlaneClient';
 import { common } from '@kit.AbilityKit';
 
 /**
@@ -63,7 +62,10 @@ export struct NamespaceBrowser {
     }
   }
 
-  /** 同步：首次全量（since=0），此后按游标增量 */
+  /** P0-2：身份失效（401）回调——通知宿主页面自愈（清身份→重注册→恢复心跳） */
+  onAuthLost?: () => void;
+
+  /** 同步：首次全量（since=0），此后按游标增量（P0-1：含墓碑删除与版本回退保护） */
   async sync(): Promise<void> {
     if (!this.registered || this.deviceToken.length === 0) {
       this.syncMsg = '请先注册设备';
@@ -77,14 +79,28 @@ export struct NamespaceBrowser {
       const since: number = await this.store.getSyncedVersion();
       const client = new ControlPlaneClient(this.ctrlUrl);
       const resp: NamespaceResponse = await client.fetchNamespace(this.deviceToken, since);
-      await this.store.upsertNodes(resp.nodes);
-      await this.store.setSyncedVersion(resp.version);
-      this.syncMsg = `已同步（${resp.mode === 'full' ? '全量' : '增量'} `
-        + `${resp.nodes.length} 节点，v${since}→v${resp.version}）`;
+      if (resp.version < since) {
+        // P0-1：服务端版本回退（重启/重置）——禁止游标倒退，清库全量重拉
+        await this.store.resetAll(resp.nodes, resp.version);
+        this.syncMsg = `检测到服务端版本回退 v${since}→v${resp.version}，已全量重拉 `
+          + `${resp.nodes.length} 节点`;
+      } else {
+        await this.store.applyChanges(resp.nodes, resp.version);
+        this.syncMsg = `已同步（${resp.mode === 'full' ? '全量' : '增量'} `
+          + `${resp.nodes.length} 节点，v${since}→v${resp.version}）`;
+      }
       await this.refreshStat();
       await this.refreshRoot();
     } catch (e) {
-      this.syncMsg = `同步失败: ${e}`;
+      if (e instanceof HttpError && e.statusCode === 401) {
+        // P0-2：token 失效（mock 重启内存丢失/服务端重置）→ 通知宿主自愈
+        this.syncMsg = '身份失效（401），已触发自动重注册';
+        if (this.onAuthLost !== undefined) {
+          this.onAuthLost();
+        }
+      } else {
+        this.syncMsg = `同步失败: ${e}`;
+      }
     }
     this.syncing = false;
   }
