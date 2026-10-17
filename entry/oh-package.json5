@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "StorPool HarmonyOS entry module",
+  "main": "",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "libstorpool_napi": "file:./src/main/ets/types/libstorpool_napi"
+  }
+}

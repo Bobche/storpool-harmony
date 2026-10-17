@@ -1,0 +1,9 @@
+{
+  "name": "libstorpool_napi",
+  "version": "0.1.0",
+  "description": "StorPool NAPI bridge type declarations (Rust: syncthing-rust bep-protocol)",
+  "main": "index.d.ts",
+  "types": "index.d.ts",
+  "author": "",
+  "license": "Apache-2.0"
+}

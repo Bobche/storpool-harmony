@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["storpool-napi"]
+
+# H0b 阶段：bep-protocol 以 path 依赖指向 h0-research 的 syncthing-rust 克隆
+# H1 起如需固定版本，改为 git 依赖或 vendor 进本仓库
+[workspace.dependencies]
+bep-protocol = { path = "../../h0-research/syncthing-rust/crates/bep-protocol" }
+
+[profile.release]
+opt-level = 2
+lto = false

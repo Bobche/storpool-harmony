@@ -1,0 +1,25 @@
+/node_modules
+/oh_modules
+**/node_modules
+**/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# Rust 交叉编译构建产物（~556MB，**/build 覆盖不到 target 目录名）
+rust/target
+
+# 运行日志
+*.log
+mock-control-plane/server.log
+
+# CodeArts Agent 本地工作数据（会话记录/缓存/临时文件，不跨机共享）
+.codeartsdoer/
+.merkle-snapshot.json

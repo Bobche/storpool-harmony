@@ -1,0 +1,11 @@
+[package]
+name = "storpool-napi"
+version = "0.1.0"
+edition = "2021"
+description = "StorPool NAPI bridge: syncthing-rust core exposed to HarmonyOS ArkTS"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bep-protocol = { workspace = true }
