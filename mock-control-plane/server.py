@@ -6,6 +6,10 @@
   POST /devices/heartbeat  {deviceId} (Bearer deviceToken) -> {status, serverTime}
   GET  /devices            -> 全量设备快照（联调观测用）
   GET  /namespace[?since=N] (Bearer deviceToken)           -> {version, mode, nodes}  H2 元数据
+  GET  /data/<nodeId>       (Bearer deviceToken)           -> 文件内容（H4 分片下载，支持 Range）
+       无 Range 全量 200；Range: bytes=start-end -> 206 Partial Content（end 可空=到文件尾）
+       响应头：ETag / X-Content-Sha256（全文件 sha256）/ Content-Range / Accept-Ranges
+       file 节点的 /namespace JSON 亦携带 sha256 字段（客户端从元数据取期望校验值）
   POST /admin/namespace/delete   {id}                      -> 节点墓碑（级联子树）+ 版本推进（P0-1 删除语义用例）
   POST /admin/namespace/rollback {version}                 -> 服务端版本回退（模拟重置，P0-1 游标保护用例）
 
@@ -17,7 +21,9 @@ P0-1 协议语义（Go 控制面对齐基线）：
 
 用法：python server.py [port]   （默认 8765）
 """
+import hashlib
 import json
+import re
 import sys
 import threading
 import time
@@ -98,6 +104,39 @@ def rollback_namespace(target_version: int) -> dict:
         return {'version': NAMESPACE_VERSION, 'previous': previous}
 
 
+# ---------------- H4：文件数据源（确定性生成 + sha256） ----------------
+DATA_CACHE: dict = {}  # node_id -> bytes（懒生成，进程内缓存）
+SHA_CACHE: dict = {}   # node_id -> sha256 hex
+SEED_BLOCK_LEN = 4096
+
+
+def file_data(node: dict) -> bytes:
+    """H4：确定性文件内容——4KiB 种子块（sha256(node id+name) 派生）平铺到 size。
+
+    跨重启内容不变，客户端可对任意分片做 sha256 校验。
+    """
+    nid = node['id']
+    if nid not in DATA_CACHE:
+        seed = hashlib.sha256(f'storpool-seed-{nid}-{node["name"]}'.encode()).digest()
+        block4k = seed * (SEED_BLOCK_LEN // len(seed))  # 32B × 128 = 4096B
+        n_blocks = (node['size'] + SEED_BLOCK_LEN - 1) // SEED_BLOCK_LEN
+        DATA_CACHE[nid] = (block4k * n_blocks)[:node['size']]
+    return DATA_CACHE[nid]
+
+
+def file_sha(node: dict) -> str:
+    nid = node['id']
+    if nid not in SHA_CACHE:
+        SHA_CACHE[nid] = hashlib.sha256(file_data(node)).hexdigest()
+    return SHA_CACHE[nid]
+
+
+# 启动即为全部 file 节点补齐 sha256 元数据字段（/namespace 与 /data 共用真值）
+for _n in NAMESPACE_NODES:
+    if _n['type'] == 'file':
+        _n['sha256'] = file_sha(_n)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'StorPoolMockCP/0.2'
 
@@ -105,6 +144,17 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _bytes(self, code: int, body: bytes, extra_headers: dict) -> None:
+        """H4：二进制响应（/data 端点），自动带 Accept-Ranges 与 Content-Length"""
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Accept-Ranges', 'bytes')
+        for k, v in extra_headers.items():
+            self.send_header(k, v)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -224,6 +274,49 @@ class Handler(BaseHTTPRequestHandler):
                   f'-> {len(nodes)} nodes, version={version}')
             self._json(200, {'version': version, 'mode': mode, 'nodes': nodes})
             return
+        m = re.fullmatch(r'/data/(\d+)', parsed.path)
+        if m:
+            # H4：分片下载端点（无 Range 全量 200；Range: bytes=s-e -> 206）
+            device_id = self._auth_device()
+            if device_id is None:
+                self._json(401, {'error': 'unauthorized', 'serverTime': now_ms()})
+                return
+            node_id = int(m.group(1))
+            with LOCK:
+                node = next((n for n in NAMESPACE_NODES if n['id'] == node_id), None)
+                if node is None or node.get('deleted'):
+                    self._json(404, {'error': f'node {node_id} not found'})
+                    return
+                if node['type'] != 'file':
+                    self._json(400, {'error': f'node {node_id} is not a file'})
+                    return
+                data = file_data(node)
+                sha = file_sha(node)
+            total = len(data)
+            rng = self.headers.get('Range', '').strip()
+            mm = re.fullmatch(r'bytes=(\d+)-(\d*)', rng)
+            if mm:
+                start = int(mm.group(1))
+                end = int(mm.group(2)) if mm.group(2) else total - 1
+                end = min(end, total - 1)
+                if start >= total:
+                    self._bytes(416, b'', {'Content-Range': f'bytes */{total}',
+                                           'X-Content-Sha256': sha})
+                    return
+                if end >= start:
+                    chunk = data[start:end + 1]
+                    self._bytes(206, chunk, {
+                        'Content-Range': f'bytes {start}-{end}/{total}',
+                        'ETag': f'"{sha}"',
+                        'X-Content-Sha256': sha,
+                    })
+                    print(f'[data] {device_id} node={node_id} '
+                          f'range={start}-{end} ({len(chunk)}B, 206)')
+                    return
+            # 无 Range / 无法解析的 Range：全量 200
+            self._bytes(200, data, {'ETag': f'"{sha}"', 'X-Content-Sha256': sha})
+            print(f'[data] {device_id} node={node_id} full ({total}B, 200)')
+            return
         if parsed.path == '/health':
             with LOCK:
                 tombs = sum(1 for n in NAMESPACE_NODES if n.get('deleted'))
@@ -242,8 +335,8 @@ def main() -> None:
     server = ThreadingHTTPServer(('0.0.0.0', port), Handler)
     print(f'StorPool mock control plane listening on 0.0.0.0:{port}')
     print('endpoints: POST /devices/register | POST /devices/heartbeat | '
-          'GET /devices | GET /namespace[?since=N] | GET /health | '
-          'POST /admin/namespace/delete | POST /admin/namespace/rollback')
+          'GET /devices | GET /namespace[?since=N] | GET /data/<id>[Range] | '
+          'GET /health | POST /admin/namespace/delete | POST /admin/namespace/rollback')
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -193,9 +193,9 @@ struct Index {
         this.hbLastTime = Index.fmtTime(Date.now());
         this.hbStatus = '在线';
         // H3：保活运行中时，每次心跳联动更新实况窗进度（防 dataTransfer 10 分钟无进度被取消）
+        // P0-3：无传输任务时进度合规传 0（实况窗进度不得伪造，真实进度由 ChunkedDownloader 上报）
         if (keeper.isRunning()) {
-          const pct: number = (this.hbCount * 5) % 101;
-          keeper.publishProgress(`StorPool 同步中（心跳 ${this.hbCount} 次）`, 'heartbeat', pct);
+          keeper.publishProgress(`StorPool 在线（心跳 ${this.hbCount} 次，无传输任务）`, 'heartbeat', 0);
         }
       } else {
         this.hbStatus = `心跳异常: status=${resp.status}`;
@@ -247,8 +247,8 @@ struct Index {
     if (result.startsWith('OK')) {
       this.kaRunning = true;
       this.kaStatus = `已保活 nid=${result.substring(3)}`;
-      const pct: number = (this.hbCount * 5) % 101;
-      keeper.publishProgress(`StorPool 同步中（心跳 ${this.hbCount} 次）`, 'heartbeat', pct);
+      // P0-3：初始无传输任务，进度合规传 0（真实进度由 ChunkedDownloader 上报）
+      keeper.publishProgress('StorPool 在线（无传输任务）', 'heartbeat', 0);
     } else {
       this.kaRunning = false;
       this.kaStatus = `申请失败 ${result}`;

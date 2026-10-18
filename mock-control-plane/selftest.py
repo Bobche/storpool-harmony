@@ -15,7 +15,15 @@
   9. 版本回退（rollback 到 v2）
   10. 回退后 resp.version < since（客户端须全量重拉的保护判定依据）
   11. 无 token 返回 401（P0-2 自愈判定依据）
+  12. H4 全量下载 report.pdf（200 + X-Content-Sha256 与本地 sha256 一致 + 与 /namespace 元数据一致）
+  13. Range 0-1023 → 206 + Content-Range + 片段内容正确
+  14. 开放 Range（start-）→ 206 到文件尾
+  15. 分片重组（0-65535 + 65536-131071）== 全量前 128KiB（H4 分片下载正确性）
+  16. 越界 Range → 416
+  17. 目录节点 → 400
+  18. 已删除节点（tombstone）→ 404
 """
+import hashlib
 import json
 import sys
 import urllib.error
@@ -46,6 +54,23 @@ def req(method: str, path: str, body: dict = None, token: str = '') -> tuple:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())
+
+
+def req_raw(method: str, path: str, body: dict = None,
+            token: str = '', range_header: str = '') -> tuple:
+    """H4：二进制请求（/data 端点），返回 (status, headers, bytes)"""
+    url = BASE + path
+    data = json.dumps(body).encode('utf-8') if body is not None else None
+    r = urllib.request.Request(url, data=data, method=method)
+    if token:
+        r.add_header('Authorization', 'Bearer ' + token)
+    if range_header:
+        r.add_header('Range', range_header)
+    try:
+        with urllib.request.urlopen(r) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
 
 
 def main() -> None:
@@ -109,6 +134,48 @@ def main() -> None:
     # 11. 无 token → 401
     code, _ = req('GET', '/namespace?since=0')
     check('无 token 返回 401', code == 401)
+
+    # ---------- H4：/data 分片下载 ----------
+    # 12. 全量下载 report.pdf（id=8，819200B）：sha256 三方一致（本地算/响应头/元数据）
+    code, hdr, body = req_raw('GET', '/data/8', token=tok)
+    local_sha = hashlib.sha256(body).hexdigest()
+    hdr_sha = (hdr.get('X-Content-Sha256') or hdr.get('x-content-sha256') or '')
+    meta_sha = next((n.get('sha256', '') for n in full2.get('nodes', []) if n['id'] == 8), '')
+    check('全量下载 200 + sha256 三方一致', code == 200 and len(body) == 819200
+          and local_sha == hdr_sha == meta_sha,
+          f'{len(body)}B sha={local_sha[:12]}…')
+
+    # 13. Range 0-1023 → 206 片段正确
+    code, hdr, piece = req_raw('GET', '/data/8', token=tok, range_header='bytes=0-1023')
+    check('Range 0-1023 → 206 片段正确', code == 206 and len(piece) == 1024
+          and piece == body[:1024]
+          and hdr.get('Content-Range') == 'bytes 0-1023/819200',
+          f'Content-Range={hdr.get("Content-Range")}')
+
+    # 14. 开放 Range（131072-）→ 206 到文件尾
+    code, hdr, tail = req_raw('GET', '/data/8', token=tok, range_header='bytes=131072-')
+    check('开放 Range → 206 到文件尾', code == 206
+          and len(tail) == 819200 - 131072 and tail == body[131072:],
+          f'{len(tail)}B')
+
+    # 15. 分片重组 == 全量前 128KiB（H4 分片下载核心语义）
+    _, _, p1 = req_raw('GET', '/data/8', token=tok, range_header='bytes=0-65535')
+    _, _, p2 = req_raw('GET', '/data/8', token=tok, range_header='bytes=65536-131071')
+    check('分片重组 == 全量前 128KiB', p1 + p2 == body[:131072],
+          f'{len(p1)}+{len(p2)}B')
+
+    # 16. 越界 Range → 416
+    code, hdr, _ = req_raw('GET', '/data/8', token=tok, range_header='bytes=99999999-')
+    check('越界 Range → 416', code == 416,
+          f'Content-Range={hdr.get("Content-Range")}')
+
+    # 17. 目录节点 → 400
+    code, _, _ = req_raw('GET', '/data/1', token=tok)
+    check('目录节点 → 400', code == 400)
+
+    # 18. 已删除节点（id=3 已被级联墓碑）→ 404
+    code, _, _ = req_raw('GET', '/data/3', token=tok)
+    check('已删除节点 → 404', code == 404)
 
     print(f'\n结果：{len(passed)} passed, {len(failed)} failed')
     sys.exit(0 if not failed else 1)

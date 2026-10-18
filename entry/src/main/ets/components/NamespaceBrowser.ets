@@ -1,11 +1,14 @@
 import { NamespaceNode, ControlPlaneClient, NamespaceResponse, HttpError } from '../net/ControlPlaneClient';
 import { NamespaceStore, NamespaceStat } from '../model/NamespaceStore';
+import { ChunkedDownloader, DownloadProgress, DownloadResult } from '../model/ChunkedDownloader';
+import keeper from '../model/backgroundKeeperInstance';
 import { common } from '@kit.AbilityKit';
 
 /**
- * 虚拟目录树浏览组件（H2）
+ * 虚拟目录树浏览组件（H2 + H4）
  *
  * 职责：拉取（全量/增量）→ SQLite 缓存 → 面包屑 + 列表浏览
+ *       文件项分片下载（H4：Range GET → 重组 → sha256 校验 → 落盘 filesDir/downloads）
  * 数据流：控制面 GET /namespace?since=游标 → upsert namespace 表 → 本地查询渲染
  */
 class Crumb {
@@ -30,8 +33,16 @@ export struct NamespaceBrowser {
   @State crumbs: Crumb[] = [];
   @State entries: NamespaceNode[] = [];
 
+  // ---- H4：分片下载状态 ----
+  @State dlRunning: boolean = false;
+  @State dlName: string = '';
+  @State dlPercent: number = 0;
+  @State dlDetail: string = '';
+  @State dlMsg: string = '';
+
   private store: NamespaceStore = new NamespaceStore();
   private storeReady: boolean = false;
+  private downloader: ChunkedDownloader | null = null;
 
   private static fmtSize(bytes: number): string {
     if (bytes < 1024) {
@@ -103,6 +114,53 @@ export struct NamespaceBrowser {
       }
     }
     this.syncing = false;
+  }
+
+  /** H4：分片下载文件节点到 filesDir/downloads（进度联动 UI + keeper 实况窗） */
+  async startDownload(node: NamespaceNode): Promise<void> {
+    if (this.dlRunning) {
+      this.dlMsg = '已有下载进行中，请稍候';
+      return;
+    }
+    if (!this.registered || this.deviceToken.length === 0) {
+      this.dlMsg = '设备未注册，无法下载';
+      return;
+    }
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (ctx === undefined) {
+      this.dlMsg = '获取 Context 失败';
+      return;
+    }
+    this.dlRunning = true;
+    this.dlName = node.name;
+    this.dlPercent = 0;
+    this.dlDetail = '';
+    this.dlMsg = '';
+    const downloader = new ChunkedDownloader(this.ctrlUrl, this.deviceToken);
+    this.downloader = downloader;
+    try {
+      const destDir: string = `${ctx.filesDir}/downloads`;
+      const onProgress = (p: DownloadProgress): void => {
+        this.dlPercent = p.percent;
+        this.dlDetail = `${p.stage} · ${p.detail}`;
+        // P0-3：真实进度联动实况窗（keeper 未运行时其内部直接 return，安全）
+        keeper.publishProgress(`StorPool 下载 ${p.fileName}`, p.detail, p.percent);
+      };
+      const result: DownloadResult = await downloader.download(node, destDir, onProgress);
+      this.dlMsg = `✅ ${node.name} 已下载（${result.receivedBytes}B，sha256 校验`
+        + `${result.verified ? '通过' : '跳过'}，${result.durationMs}ms）→ ${result.filePath}`;
+    } catch (e) {
+      if (e instanceof HttpError && e.statusCode === 401) {
+        this.dlMsg = '❌ 下载失败：身份失效（401），已触发自动重注册';
+        if (this.onAuthLost !== undefined) {
+          this.onAuthLost();
+        }
+      } else {
+        this.dlMsg = `❌ 下载失败: ${e}`;
+      }
+    }
+    this.dlRunning = false;
+    this.downloader = null;
   }
 
   private async refreshStat(): Promise<void> {
@@ -213,6 +271,17 @@ export struct NamespaceBrowser {
                   Text(NamespaceBrowser.fmtSize(n.size))
                     .fontSize(11)
                     .fontColor('#888888')
+                  // H4：分片下载入口（下载中禁用）
+                  Button(this.dlRunning && this.dlName === n.name ? '…' : '⬇')
+                    .fontSize(12)
+                    .height(28)
+                    .width(36)
+                    .padding(0)
+                    .backgroundColor(this.dlRunning && this.dlName === n.name ? '#9E9E9E' : '#42A5F5')
+                    .enabled(this.registered && !this.dlRunning)
+                    .onClick(() => {
+                      this.startDownload(n);
+                    })
                 }
               }
               .width('100%')
@@ -232,6 +301,44 @@ export struct NamespaceBrowser {
         .scrollBar(BarState.Auto)
       } else if (this.statLine.length > 0) {
         Text('（空目录）').fontSize(12).fontColor('#AAAAAA')
+      }
+
+      // H4：下载进度区块（下载中展示进度条；结果消息常驻展示）
+      if (this.dlRunning || this.dlMsg.length > 0) {
+        Column({ space: 4 }) {
+          if (this.dlRunning) {
+            Row({ space: 8 }) {
+              Text(this.dlName)
+                .fontSize(12)
+                .layoutWeight(1)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text(`${this.dlPercent}%`)
+                .fontSize(12)
+                .fontColor('#1976D2')
+            }
+            .width('100%')
+            Progress({ value: this.dlPercent, total: 100, type: ProgressType.Linear })
+              .width('100%')
+            Text(this.dlDetail)
+              .fontSize(10)
+              .fontColor('#888888')
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          if (this.dlMsg.length > 0) {
+            Text(this.dlMsg)
+              .fontSize(11)
+              .fontColor(this.dlMsg.startsWith('✅') ? '#2E7D32' : '#C62828')
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+        }
+        .width('100%')
+        .padding(8)
+        .borderRadius(6)
+        .backgroundColor('#FFFFFF')
+        .alignItems(HorizontalAlign.Start)
       }
 
       if (!this.registered) {

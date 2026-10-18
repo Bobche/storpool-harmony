@@ -10,6 +10,8 @@ export class BackgroundKeeper {
   private notificationId: number = -1;
   private running: boolean = false;
   private netCon: connection.NetConnection | null = null;
+  // P0-3：进度上报节流（500ms 内不重复发布；100% 终态始终放行）
+  private lastPublishAt: number = 0;
 
   isRunning(): boolean {
     return this.running;
@@ -64,11 +66,20 @@ export class BackgroundKeeper {
     }
   }
 
-  /** 更新实况窗进度通知（dataTransfer 要求 10 分钟内有进度更新，否则任务被系统取消） */
+  /** 更新实况窗进度通知（dataTransfer 要求 10 分钟内有进度更新，否则任务被系统取消）
+   *  P0-3 合规语义：progressValue 只允许真实进度——下载中传真实百分比，
+   *  无传输任务的心跳保活传 0（不伪造百分比）；500ms 节流防通知轰炸
+   */
   async publishProgress(title: string, fileName: string, progressValue: number): Promise<void> {
     if (!this.running || this.notificationId < 0) {
       return;
     }
+    const now = Date.now();
+    const isFinal = progressValue >= 100;
+    if (!isFinal && now - this.lastPublishAt < 500) {
+      return; // 节流窗口内丢弃（终态 100% 始终放行）
+    }
+    this.lastPublishAt = now;
     try {
       const template: notificationManager.NotificationTemplate = {
         name: 'downloadTemplate',

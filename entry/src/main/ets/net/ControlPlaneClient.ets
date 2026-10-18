@@ -54,6 +54,7 @@ export interface NamespaceNode {
   size: number;      // 字节
   mtime: number;     // 毫秒时间戳
   version: number;   // 节点版本（单调递增）
+  sha256?: string;   // H4：文件内容 sha256 十六进制（file 节点携带，供分片下载端到端校验）
   deleted?: boolean; // P0-1：tombstone 标记（增量拉取携带，客户端本地删除）
 }
 
