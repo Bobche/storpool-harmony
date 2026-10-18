@@ -2,10 +2,12 @@
 resolver = "2"
 members = ["storpool-napi"]
 
-# H0b 阶段：bep-protocol 以 path 依赖指向 h0-research 的 syncthing-rust 克隆
-# H1 起如需固定版本，改为 git 依赖或 vendor 进本仓库
+# P1-3 Rust 自包含（2026-10-19）：bep-protocol 连同其依赖 syncthing-core 已 vendor 进
+# rust/vendor/，仓库 clone 后 cargo build 开箱即用，不再依赖仓库外 ../../h0-research。
+# 上游来源与固定版本：github.com/juice094/syncthing-rust @ e89c53f（v3.0.5）
+# 交叉编译配方（linker/sysroot/rsproxy 镜像）见 rust/.cargo/config.toml，同样自包含。
 [workspace.dependencies]
-bep-protocol = { path = "../../h0-research/syncthing-rust/crates/bep-protocol" }
+bep-protocol = { path = "vendor/bep-protocol" }
 
 [profile.release]
 opt-level = 2

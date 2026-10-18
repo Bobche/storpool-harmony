@@ -1,0 +1,22 @@
+[package]
+name = "bep-protocol"
+version = "3.0.5"
+edition = "2021"
+
+publish = false
+
+# Vendored from https://github.com/juice094/syncthing-rust @ e89c53f (v3.0.5)
+# P1-3 Rust 自包含：原 storpool workspace 经 ../../h0-research 的 path 依赖已消除，
+# 本文件依赖版本自上游根 Cargo.toml [workspace.dependencies] 固化而来（benches/dev-deps 未随迁）。
+# crates.io 未发布 bep-protocol（404），vendor 源码是唯一离线可用渠道。
+
+[dependencies]
+syncthing-core = { path = "../syncthing-core" }
+
+tokio = { version = "1.35", features = ["full"] }
+bytes = "1.5"
+prost = "0.12"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4"] }
+parking_lot = "0.12"
