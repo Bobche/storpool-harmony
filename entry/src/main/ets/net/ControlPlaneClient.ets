@@ -1,7 +1,8 @@
-import { http } from '@kit.NetworkKit';
+import { rcp } from '@kit.RemoteCommunicationKit';
+import { util } from '@kit.ArkTS';
 
 /**
- * 控制面 HTTP 客户端（H1/H2）
+ * 控制面 HTTP 客户端（H1/H2）—— P1-8 rcp Session 重构
  *
  * 对接控制面 API（H1 阶段为 mock：mock-control-plane/server.py）：
  *   POST /devices/register   {deviceName, platform}          -> {deviceId, deviceToken, serverTime}
@@ -10,6 +11,13 @@ import { http } from '@kit.NetworkKit';
  *
  * 鉴权：H1 用 Bearer token 简化；正式 mTLS 双向证书在控制面 Go 侧就绪后升级。
  * 错误：非 200 抛 HttpError（携带 statusCode，供调用方判定 401 自愈，P0-2）。
+ *
+ * P1-8 重构要点：
+ *   - 使用 rcp.Session 替代每次 http.createHttp()，实现连接复用（keep-alive）
+ *   - Session 配置 baseAddress，请求只需传 path
+ *   - 统一超时配置（connectMs=5000, transferMs=5000）
+ *   - 401 自愈语义完全保留（HttpError.statusCode 不变）
+ *   - 协议契约以 docs/openapi.yaml 为单一事实源
  */
 export interface RegisterResponse {
   deviceId: string;
@@ -64,37 +72,80 @@ export interface NamespaceResponse {
   nodes: NamespaceNode[];
 }
 
-const TIMEOUT_MS = 5000;
+const TIMEOUT_CONNECT_MS = 5000;
+const TIMEOUT_TRANSFER_MS = 5000;
 
 export class ControlPlaneClient {
-  private baseUrl: string;
+  private session: rcp.Session;
 
   constructor(baseUrl: string) {
-    this.baseUrl = baseUrl;
+    this.session = rcp.createSession({
+      baseAddress: baseUrl,
+      requestConfiguration: {
+        transfer: {
+          timeout: {
+            connectMs: TIMEOUT_CONNECT_MS,
+            transferMs: TIMEOUT_TRANSFER_MS,
+          },
+        },
+      },
+    });
   }
 
+  /** 关闭 Session，释放连接资源 */
+  close(): void {
+    this.session.close();
+  }
+
+  /**
+   * 发送 POST 请求（内部统一方法）
+   *
+   * @param path API 路径（如 '/devices/register'）
+   * @param body 请求体对象（将作为 JSON 发送）
+   * @param token 可选的 Bearer token
+   * @returns 解析后的 JSON 响应对象
+   * @throws HttpError 当响应状态码非 200 时
+   */
   private async postJson(path: string, body: object, token?: string): Promise<object> {
-    const client: http.HttpRequest = http.createHttp();
-    try {
-      const header: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (token !== undefined && token.length > 0) {
-        header['Authorization'] = `Bearer ${token}`;
-      }
-      const resp: http.HttpResponse = await client.request(`${this.baseUrl}${path}`, {
-        method: http.RequestMethod.POST,
-        header: header,
-        extraData: JSON.stringify(body),
-        expectDataType: http.HttpDataType.OBJECT,
-        connectTimeout: TIMEOUT_MS,
-        readTimeout: TIMEOUT_MS,
-      });
-      if (resp.responseCode !== 200) {
-        throw new HttpError(resp.responseCode, path);
-      }
-      return resp.result as object;
-    } finally {
-      client.destroy();
+    const headers: rcp.RequestHeaders = { 'content-type': 'application/json' };
+    if (token !== undefined && token.length > 0) {
+      headers['authorization'] = `Bearer ${token}`;
     }
+    const request: rcp.Request = new rcp.Request(path, 'POST', headers, body);
+    const resp: rcp.Response = await this.session.fetch(request);
+    if (resp.statusCode !== 200) {
+      throw new HttpError(resp.statusCode, path);
+    }
+    return this.parseBody(resp);
+  }
+
+  /**
+   * 发送 GET 请求（内部统一方法）
+   *
+   * @param path API 路径含 query（如 '/namespace?since=0'）
+   * @param token Bearer token
+   * @returns 解析后的 JSON 响应对象
+   * @throws HttpError 当响应状态码非 200 时
+   */
+  private async getJson(path: string, token: string): Promise<object> {
+    const headers: rcp.RequestHeaders = { 'authorization': `Bearer ${token}` };
+    const request: rcp.Request = new rcp.Request(path, 'GET', headers);
+    const resp: rcp.Response = await this.session.fetch(request);
+    if (resp.statusCode !== 200) {
+      throw new HttpError(resp.statusCode, path);
+    }
+    return this.parseBody(resp);
+  }
+
+  /** 将 rcp.Response.body (ArrayBuffer) 解析为 JSON 对象 */
+  private parseBody(resp: rcp.Response): object {
+    if (resp.body === undefined || resp.body === null) {
+      const emptyObj: Record<string, Object> = {};
+      return emptyObj;
+    }
+    const decoder: util.TextDecoder = util.TextDecoder.create('utf-8');
+    const text: string = decoder.decodeToString(new Uint8Array(resp.body));
+    return JSON.parse(text) as object;
   }
 
   async register(deviceName: string, platform: string): Promise<RegisterResponse> {
@@ -115,23 +166,7 @@ export class ControlPlaneClient {
 
   /** H2：拉取虚拟目录树（since=0 全量只含活节点；增量含墓碑，version>since） */
   async fetchNamespace(deviceToken: string, since: number): Promise<NamespaceResponse> {
-    const client: http.HttpRequest = http.createHttp();
-    try {
-      const header: Record<string, string> = { 'Authorization': `Bearer ${deviceToken}` };
-      const resp: http.HttpResponse = await client.request(
-        `${this.baseUrl}/namespace?since=${since}`, {
-        method: http.RequestMethod.GET,
-        header: header,
-        expectDataType: http.HttpDataType.OBJECT,
-        connectTimeout: TIMEOUT_MS,
-        readTimeout: TIMEOUT_MS,
-      });
-      if (resp.responseCode !== 200) {
-        throw new HttpError(resp.responseCode, '/namespace');
-      }
-      return resp.result as NamespaceResponse;
-    } finally {
-      client.destroy();
-    }
+    const r: object = await this.getJson(`/namespace?since=${since}`, deviceToken);
+    return r as NamespaceResponse;
   }
 }
