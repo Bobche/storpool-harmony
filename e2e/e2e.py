@@ -260,6 +260,29 @@ def wait_for(ui: UiTree, pattern, timeout=20, poll=1.5):
     return None
 
 
+def ensure_screen_awake(hdc: Hdc):
+    """屏幕唤醒 + 锁屏自动上滑解锁（模拟器冷启动常锁屏；无密码场景）。
+
+    幂等：已解锁时无任何动作。锁屏判定：dump 含大时钟星期文本且无桌面/应用特征。
+    """
+    try:
+        hdc.shell('power-shell wakeup', timeout=10)
+        hdc.shell('power-shell timeout -t 1800000', timeout=10)  # 30 分钟不锁屏
+        time.sleep(0.8)
+        ui = UiTree(hdc).dump()
+    except (HdcError, json.JSONDecodeError, OSError):
+        return  # dump 失败不阻塞主流程（后续阶段各自有 dump 重试）
+    texts = [n.text for n in ui.root.iter_all() if n.text]
+    has_clock = any(re.search(r'星期[一二三四五六日天]', t) for t in texts)
+    has_home = any(('StorPool' in t or t in ('设置', '图库', '文件管理', '日历')
+                    or 'H0b' in t) for t in texts)
+    if has_clock and not has_home:
+        w, h = ui.screen or (1080, 2340)
+        print('  [screen] 检测到锁屏，上滑解锁…')
+        ui.swipe(w // 2, int(h * 0.85), w // 2, int(h * 0.25), 500)
+        time.sleep(1.5)
+
+
 def phase_device(rep: Report, hdc: Hdc, args) -> bool:
     print('\n== 阶段 device：设备端全流程 ==')
 
@@ -288,6 +311,9 @@ def phase_device(rep: Report, hdc: Hdc, args) -> bool:
 
     launched = False
     try:
+        # ---- 屏幕唤醒/解锁（幂等） ----
+        ensure_screen_awake(hdc)
+
         # ---- 安装 + 启动（卸载保证全新身份/数据） ----
         hdc.uninstall()
         code, out = hdc.install(hap)
