@@ -409,8 +409,13 @@ unsafe extern "C" fn napi_sha256_hex(env: napi_env, info: napi_callback_info) ->
         return promise;
     }
     // 拷贝出 buffer 内容：async 期间 JS 侧可能 detach/复用，拷贝最安全
-    let bytes: Vec<u8> =
-        unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) }.to_vec();
+    // H4 边界修复：0 字节 ArrayBuffer（空文件下载）时 data_ptr 可能为 NULL/悬挂——
+    // Rust 语义下 from_raw_parts(ptr, 0) 仍要求 ptr 非空且对齐，属 UB，须短路为空 Vec
+    let bytes: Vec<u8> = if data_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) }.to_vec()
+    };
     let task = Box::into_raw(Box::new(Sha256Task {
         bytes: bytes,
         hex: String::new(),
