@@ -106,7 +106,7 @@ export class DeviceIdentity {
       const err = e as BusinessError;
       if (err.code !== 24000002) {
         // 非 "not found" 错误，抛出
-        throw e;
+        throw new Error(`Asset update failed: ${err.code} ${err.message}`);
       }
       // 24000002 = not found → 需要 add
     }
@@ -158,7 +158,7 @@ export class DeviceIdentity {
       const err = e as BusinessError;
       if (err.code !== 24000002) {
         // 非 "not found" 错误，抛出
-        throw e;
+        throw new Error(`Asset remove failed: ${err.code} ${err.message}`);
       }
       // not found 时静默忽略
     }
