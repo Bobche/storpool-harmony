@@ -10,8 +10,11 @@
        无 Range 全量 200；Range: bytes=start-end -> 206 Partial Content（end 可空=到文件尾）
        响应头：ETag / X-Content-Sha256（全文件 sha256）/ Content-Range / Accept-Ranges
        file 节点的 /namespace JSON 亦携带 sha256 字段（客户端从元数据取期望校验值）
-  POST /admin/namespace/delete   {id}                      -> 节点墓碑（级联子树）+ 版本推进（P0-1 删除语义用例）
-  POST /admin/namespace/rollback {version}                 -> 服务端版本回退（模拟重置，P0-1 游标保护用例）
+   POST /admin/namespace/delete   {id}                      -> 节点墓碑（级联子树）+ 版本推进（P0-1 删除语义用例）
+   POST /admin/namespace/rollback {version}                 -> 服务端版本回退（模拟重置，P0-1 游标保护用例）
+   POST /admin/namespace/add-file {name, size, parentId?, sha256Override?}
+        -> 注入边界测试文件（0B/1B/块±1B 等），版本推进；sha256Override 可伪造元数据
+           sha（客户端下载后必须检出不匹配，负向用例专用）
 
 P0-1 协议语义（Go 控制面对齐基线）：
   - 删除：tombstone 模式——节点标记 deleted=true 并推进全局版本；增量拉取(version>since)
@@ -102,6 +105,30 @@ def rollback_namespace(target_version: int) -> dict:
         previous = NAMESPACE_VERSION
         NAMESPACE_VERSION = target_version
         return {'version': NAMESPACE_VERSION, 'previous': previous}
+
+
+def add_file_node(name: str, size: int, parent_id: int = 1,
+                  sha_override: str = '') -> dict:
+    """H4 边界用例：注入任意大小的虚拟文件节点（版本推进，增量可发现）。
+
+    sha_override 非空时元数据 sha256 用伪造值（/data 响应头仍返回真实值），
+    供客户端"sha 不匹配必须报错"的负向用例检出。
+    """
+    global NAMESPACE_VERSION
+    with LOCK:
+        parent = next((n for n in NAMESPACE_NODES
+                       if n['id'] == parent_id and n['type'] == 'dir'
+                       and not n.get('deleted')), None)
+        if parent is None:
+            return {'error': f'parent dir {parent_id} not found'}
+        new_id = max(n['id'] for n in NAMESPACE_NODES) + 1
+        NAMESPACE_VERSION += 1
+        node = {'id': new_id, 'parentId': parent_id, 'name': name, 'type': 'file',
+                'size': size, 'mtime': now_ms(), 'version': NAMESPACE_VERSION}
+        node['sha256'] = sha_override if sha_override else file_sha(node)
+        NAMESPACE_NODES.append(node)
+        return {'id': new_id, 'version': NAMESPACE_VERSION, 'size': size,
+                'sha256': node['sha256']}
 
 
 # ---------------- H4：文件数据源（确定性生成 + sha256） ----------------
@@ -235,6 +262,25 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {'ok': True, 'serverTime': now_ms(), **result})
             return
 
+        if self.path == '/admin/namespace/add-file':
+            name = str(payload.get('name', ''))
+            size = int(payload.get('size', -1))
+            parent_id = int(payload.get('parentId', 1))
+            sha_override = str(payload.get('sha256Override', ''))
+            if not name or size < 0:
+                self._json(400, {'error': 'name (non-empty) and size (>=0) required',
+                                 'serverTime': now_ms()})
+                return
+            result = add_file_node(name, size, parent_id, sha_override)
+            if 'error' in result:
+                self._json(404, {**result, 'serverTime': now_ms()})
+                return
+            print(f'[admin] add-file {name} id={result["id"]} '
+                  f'size={size} parent={parent_id}'
+                  + (' [sha OVERRIDE]' if sha_override else ''))
+            self._json(200, {'ok': True, 'serverTime': now_ms(), **result})
+            return
+
         self._json(404, {'error': 'not found'})
 
     def do_GET(self) -> None:  # noqa: N802
@@ -336,7 +382,8 @@ def main() -> None:
     print(f'StorPool mock control plane listening on 0.0.0.0:{port}')
     print('endpoints: POST /devices/register | POST /devices/heartbeat | '
           'GET /devices | GET /namespace[?since=N] | GET /data/<id>[Range] | '
-          'GET /health | POST /admin/namespace/delete | POST /admin/namespace/rollback')
+          'GET /health | POST /admin/namespace/delete | POST /admin/namespace/rollback | '
+          'POST /admin/namespace/add-file')
     try:
         server.serve_forever()
     except KeyboardInterrupt:

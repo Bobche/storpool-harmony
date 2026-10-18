@@ -22,6 +22,13 @@
   16. 越界 Range → 416
   17. 目录节点 → 400
   18. 已删除节点（tombstone）→ 404
+  --- H4 边界用例（依赖 /admin/namespace/add-file）---
+  19. 0B 空文件：200 + 0 字节 + sha=e3b0c442…（空输入 sha256 真值）
+  20. 1B 文件：Range 0-0 → 206 单字节
+  21. 块-1B（131071B）：单片覆盖，开放 Range == 全量
+  22. 块+1B（131073B）：末片 1B + 两片重组 == 全量
+  23. sha256Override 篡改：元数据 sha ≠ 响应头真实 sha（客户端负向检出依据）
+  24. 增量拉取发现全部注入节点（版本推进语义）
 """
 import hashlib
 import json
@@ -71,6 +78,18 @@ def req_raw(method: str, path: str, body: dict = None,
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
+
+
+# 边界用例基线：注入 0B / 1B / 块-1B / 块+1B / sha 篡改 文件到根目录（id=1）
+BLOCK = 131072  # 128KiB，BEP 语义块大小
+
+
+def add_edge_file(name: str, size: int, sha_override: str = '') -> dict:
+    code, r = req('POST', '/admin/namespace/add-file',
+                  {'name': name, 'size': size, 'parentId': 1,
+                   **({'sha256Override': sha_override} if sha_override else {})})
+    assert code == 200, f'add-file {name} 失败: {r}'
+    return r
 
 
 def main() -> None:
@@ -176,6 +195,69 @@ def main() -> None:
     # 18. 已删除节点（id=3 已被级联墓碑）→ 404
     code, _, _ = req_raw('GET', '/data/3', token=tok)
     check('已删除节点 → 404', code == 404)
+
+    # ---------- H4 边界用例（19-24）：块大小临界 + sha 篡改检出 ----------
+    v_edge0 = rbns.get('version', 0)  # 回退后的版本基线，增量用例参照
+
+    # 19. 0B 空文件：全量 200 + 0 字节 + sha=e3b0c442…（空输入 sha256 真值）
+    n0 = add_edge_file('edge-0b.bin', 0)
+    code, hdr, body0 = req_raw('GET', f'/data/{n0["id"]}', token=tok)
+    empty_sha = hashlib.sha256(b'').hexdigest()
+    check('0B 空文件全量下载', code == 200 and len(body0) == 0
+          and (hdr.get('X-Content-Sha256') or hdr.get('x-content-sha256')) == empty_sha
+          and n0['sha256'] == empty_sha,
+          f'id={n0["id"]} sha={empty_sha[:12]}…')
+
+    # 20. 1B 文件：Range bytes=0-0 → 206 单字节
+    n1 = add_edge_file('edge-1b.bin', 1)
+    code, hdr, body1 = req_raw('GET', f'/data/{n1["id"]}', token=tok,
+                               range_header='bytes=0-0')
+    check('1B 文件 Range 0-0 → 206', code == 206 and len(body1) == 1
+          and hdr.get('Content-Range') == f'bytes 0-0/1',
+          f'{len(body1)}B Content-Range={hdr.get("Content-Range")}')
+
+    # 21. 块-1B（131071）：单片覆盖，开放 Range → 206 全量
+    n2 = add_edge_file('edge-block-minus1.bin', BLOCK - 1)
+    code, hdr, body2 = req_raw('GET', f'/data/{n2["id"]}', token=tok,
+                               range_header='bytes=0-')
+    check('块-1B 开放 Range → 206 全量', code == 206 and len(body2) == BLOCK - 1
+          and body2 == req_raw('GET', f'/data/{n2["id"]}', token=tok)[2],
+          f'{len(body2)}B')
+
+    # 22. 块+1B（131073）：末片 1B（Range 131072-）+ 两片重组 == 全量
+    n3 = add_edge_file('edge-block-plus1.bin', BLOCK + 1)
+    code, hdr, tail = req_raw('GET', f'/data/{n3["id"]}', token=tok,
+                              range_header=f'bytes={BLOCK}-')
+    _, _, head = req_raw('GET', f'/data/{n3["id"]}', token=tok,
+                         range_header=f'bytes=0-{BLOCK - 1}')
+    code_full, _, full3 = req_raw('GET', f'/data/{n3["id"]}', token=tok)
+    check('块+1B 末片 1B + 重组 == 全量',
+          code == 206 and len(tail) == 1 and head + tail == full3
+          and hdr.get('Content-Range') == f'bytes {BLOCK}-{BLOCK}/131073',
+          f'{len(head)}+{len(tail)}B')
+
+    # 23. sha256Override 篡改：元数据 sha ≠ /data 响应头真实 sha（客户端检出依据）
+    fake_sha = 'f' * 64
+    n4 = add_edge_file('edge-corrupt.bin', 4096, sha_override=fake_sha)
+    code, hdr, _ = req_raw('GET', f'/data/{n4["id"]}', token=tok)
+    real_sha = hdr.get('X-Content-Sha256') or hdr.get('x-content-sha256') or ''
+    check('sha 篡改节点：元数据与响应头 sha 分离',
+          code == 200 and n4['sha256'] == fake_sha and real_sha != fake_sha
+          and len(real_sha) == 64,
+          f'元数据={fake_sha[:8]}… 响应头={real_sha[:8]}…')
+
+    # 24. 增量拉取发现全部注入节点（版本推进语义）
+    # 注意基线：用例 9 已回退版本到 v2，since=v2 的增量必然包含墓碑与 v3 旧节点，
+    # 因此断言注入的 5 个节点"都在"其中，且各带正确 version 字段（> v_edge0）
+    code, inc2 = req('GET', f'/namespace?since={v_edge0}', token=tok)
+    inc_nodes = {n['id']: n for n in inc2.get('nodes', [])}
+    injected = [n0['id'], n1['id'], n2['id'], n3['id'], n4['id']]
+    all_found = all(i in inc_nodes for i in injected)
+    versions_ok = all(not inc_nodes[i].get('deleted')
+                      and inc_nodes[i]['version'] > v_edge0 for i in injected if i in inc_nodes)
+    check('增量拉取发现 5 个注入节点', code == 200 and all_found and versions_ok,
+          f'found={sorted(i for i in injected if i in inc_nodes)} '
+          f'versions_ok={versions_ok}')
 
     print(f'\n结果：{len(passed)} passed, {len(failed)} failed')
     sys.exit(0 if not failed else 1)
