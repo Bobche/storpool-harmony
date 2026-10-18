@@ -20,13 +20,15 @@
                       + server 端 7 片 206 日志 + 设备侧落盘文件 sha256 三方一致）
 
 用法：
-  python e2e.py                        # 全流程（http + device；无设备自动尝试启模拟器）
+  python e2e.py                        # 全流程（http + device + heal401；无设备自动尝试启模拟器）
   python e2e.py --phase http           # 仅协议层自检（无需设备）
-  python e2e.py --phase device         # 仅设备端流程
+  python e2e.py --phase device         # 设备端流程（六步验证 + heal401 自愈场景）
+  python e2e.py --phase heal401        # 仅 P0-2 401 自愈场景（heal401.py）
   python e2e.py --skip-build           # 跳过构建（复用已有 HAP）
   python e2e.py --serial <target>      # 多设备时指定目标
   python e2e.py --json report.json     # 机器可读报告（控制台汇总始终输出）
   python e2e.py --hb-wait 25           # 第 2 次心跳等待上限（默认 22s）
+  python e2e.py --run-slow             # heal401 冷却时序真实等待 30s（默认 SKIP）
 
 依赖：hdc / uitest（API 9+）/ devecocli（构建时）/ 仅 Python 标准库。
 注意：未签名 HAP 仅可装模拟器；真机需签名（挂机器 A 的 AGC 实名流程）。
@@ -482,13 +484,16 @@ def pull_and_verify_sha(rep: Report, hdc: Hdc):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description='StorPool 完整 e2e 流程')
-    ap.add_argument('--phase', choices=['http', 'device', 'all'], default='all')
+    ap.add_argument('--phase', choices=['http', 'device', 'heal401', 'all'],
+                    default='all')
     ap.add_argument('--serial', help='hdc 目标（多设备必填）')
     ap.add_argument('--hap', help='覆盖默认 HAP 路径')
     ap.add_argument('--skip-build', action='store_true', help='复用已有 HAP')
     ap.add_argument('--json', dest='json_out', help='机器可读报告输出路径')
     ap.add_argument('--hb-wait', type=int, default=22,
-                    help='第 2 次心跳等待上限秒数（默认 22）')
+                    help='第 2 次心跳等待上限秒数（默认 22s）')
+    ap.add_argument('--run-slow', action='store_true',
+                    help='heal401 30s 冷却时序真实等待（默认 SKIP 标记）')
     ap.add_argument('--no-auto-emulator', action='store_true',
                     help='无设备时不尝试自动启动模拟器实例')
     args = ap.parse_args()
@@ -503,7 +508,7 @@ def main() -> int:
             http_ok = phase_http(rep)
             if args.phase == 'http':
                 device_ok = False  # 仅 http 模式不算 device 结果
-        if args.phase in ('device', 'all'):
+        if args.phase in ('device', 'all', 'heal401'):
             # 设备解析（BLOCKED 语义：环境不可用，非脚本失败）
             hdc = None
             try:
@@ -524,7 +529,14 @@ def main() -> int:
             if hdc is not None:
                 rep.case('设备在线', 'PASS', f'serial={hdc.serial or "(唯一)"}')
                 args.hap = args.hap  # noqa
-                device_ok = phase_device(rep, hdc, args)
+                import heal401  # 延迟导入：heal401 → e2e 单向依赖，避免循环
+                if args.phase == 'heal401':
+                    device_ok = heal401.phase_heal401(rep, hdc, args)
+                else:
+                    device_ok = phase_device(rep, hdc, args)
+                    # P0-2 401 自愈场景追加（失败经 rep FAIL 计数反映，
+                    # 不截断 device 阶段其余用例的执行）
+                    heal401.phase_heal401(rep, hdc, args)
     except KeyboardInterrupt:
         print('\n[中断] 清理中…')
         device_ok = False
