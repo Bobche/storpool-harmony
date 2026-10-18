@@ -1,0 +1,556 @@
+openapi: 3.0.3
+info:
+  title: StorPool Control Plane API
+  version: 0.2.0
+  description: |
+    StorPool 控制面 API 契约——设备注册/心跳、元数据同步、分片下载。
+
+    本文档是从 mock-control-plane/server.py 提取的单一事实源，
+    Go 控制面侧实现须以此契约为准。
+
+    ## P0-1 增量同步协议语义
+    - **删除**：tombstone 模式——节点标记 `deleted=true` 并推进全局版本；
+      增量拉取 (`version > since`) 携带墓碑，客户端负责本地删除；
+      全量拉取只返回活节点（重拉无需墓碑）。
+    - **版本回退**：客户端须校验 `resp.version >= 已同步游标`，
+      回退时清库全量重拉，禁止直接把游标写回退值。
+
+    ## 认证
+    - `POST /devices/register` 和 `GET /devices` 不需要认证
+    - 其他端点需要 `Authorization: Bearer <deviceToken>` 头
+servers:
+  - url: http://localhost:8765
+    description: Mock control plane (开发联调)
+  - url: https://api.storpool.example.com
+    description: 生产控制面 (Go 侧实现，待部署)
+
+# ============================================================================
+# 安全方案
+# ============================================================================
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+      description: "deviceToken，由 /devices/register 返回"
+
+  # ==========================================================================
+  # 数据模型
+  # ==========================================================================
+  schemas:
+    # ---- 设备相关 ----
+    RegisterRequest:
+      type: object
+      required: [deviceName, platform]
+      properties:
+        deviceName:
+          type: string
+          description: 设备显示名称（如 "HarmonyOS-A1B2"）
+          example: "HarmonyOS-A1B2"
+        platform:
+          type: string
+          description: 设备平台标识
+          example: "harmonyos"
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: 设备能力列表（可选）
+          example: ["chunked-download", "background-sync"]
+
+    RegisterResponse:
+      type: object
+      required: [deviceId, deviceToken, serverTime]
+      properties:
+        deviceId:
+          type: string
+          description: 服务端分配的设备唯一 ID
+          example: "dev-a1b2c3d4e5f6"
+        deviceToken:
+          type: string
+          description: 设备认证令牌（后续请求的 Bearer token）
+          example: "tok-a1b2c3d4e5f6a1b2"
+        serverTime:
+          type: integer
+          format: int64
+          description: 服务端时间戳（毫秒）
+          example: 1792200000000
+
+    HeartbeatRequest:
+      type: object
+      required: [deviceId]
+      properties:
+        deviceId:
+          type: string
+          description: 设备 ID
+          example: "dev-a1b2c3d4e5f6"
+
+    HeartbeatResponse:
+      type: object
+      required: [status, serverTime]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          description: 心跳状态
+        serverTime:
+          type: integer
+          format: int64
+          description: 服务端时间戳（毫秒）
+
+    DeviceSnapshot:
+      type: object
+      description: 单个设备的快照信息（GET /devices 返回）
+      properties:
+        deviceName:
+          type: string
+        platform:
+          type: string
+        registeredAt:
+          type: integer
+          format: int64
+          description: 注册时间戳（毫秒）
+        lastHeartbeat:
+          type: integer
+          format: int64
+          nullable: true
+          description: 最近心跳时间戳（毫秒），未心跳过则为 null
+        heartbeatCount:
+          type: integer
+          description: 心跳累计次数
+
+    # ---- 命名空间/元数据 ----
+    NamespaceNode:
+      type: object
+      description: 目录树节点
+      required: [id, parentId, name, type, size, mtime, version]
+      properties:
+        id:
+          type: integer
+          description: 节点唯一 ID
+        parentId:
+          type: integer
+          description: 父节点 ID（根节点 parentId=0）
+        name:
+          type: string
+          description: 节点名称（根节点为空字符串）
+        type:
+          type: string
+          enum: [dir, file]
+          description: 节点类型
+        size:
+          type: integer
+          format: int64
+          description: 文件大小（字节），目录为 0
+        mtime:
+          type: integer
+          format: int64
+          description: 修改时间戳（毫秒）
+        version:
+          type: integer
+          description: 节点版本号（全局版本推进时绑定）
+        deleted:
+          type: boolean
+          nullable: true
+          description: |
+            墓碑标记。仅增量拉取时出现——true 表示客户端应删除本地对应节点。
+            全量拉取不返回已删除节点。
+        sha256:
+          type: string
+          nullable: true
+          description: 文件内容的 SHA-256 哈希（仅 file 节点携带）
+          example: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    NamespaceResponse:
+      type: object
+      required: [version, mode, nodes]
+      properties:
+        version:
+          type: integer
+          description: 当前命名空间全局版本号（单调递增）
+        mode:
+          type: string
+          enum: [full, incremental]
+          description: |
+            拉取模式：
+            - `full`：全量拉取（since <= 0），只返回活节点
+            - `incremental`：增量拉取（since > 0），返回 version > since 的节点（含墓碑）
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/NamespaceNode'
+
+    # ---- 管理操作 ----
+    DeleteRequest:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: integer
+          description: 要删除的节点 ID
+
+    DeleteResponse:
+      type: object
+      required: [ok, serverTime, version, tombstoned]
+      properties:
+        ok:
+          type: boolean
+        serverTime:
+          type: integer
+          format: int64
+        version:
+          type: integer
+          description: 推进后的全局版本号
+        tombstoned:
+          type: array
+          items:
+            type: integer
+          description: 被标记墓碑的所有节点 ID（含级联子树）
+
+    RollbackRequest:
+      type: object
+      required: [version]
+      properties:
+        version:
+          type: integer
+          description: 目标版本号（回退到此版本）
+
+    RollbackResponse:
+      type: object
+      required: [ok, serverTime, version, previous]
+      properties:
+        ok:
+          type: boolean
+        serverTime:
+          type: integer
+          format: int64
+        version:
+          type: integer
+          description: 回退后的版本号
+        previous:
+          type: integer
+          description: 回退前的版本号
+
+    # ---- 通用 ----
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: 错误描述
+        serverTime:
+          type: integer
+          format: int64
+          nullable: true
+
+    HealthResponse:
+      type: object
+      required: [status, devices, namespaceVersion, tombstones]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        devices:
+          type: integer
+          description: 已注册设备数
+        namespaceVersion:
+          type: integer
+          description: 当前命名空间版本
+        tombstones:
+          type: integer
+          description: 墓碑节点数
+
+# ============================================================================
+# API 端点
+# ============================================================================
+paths:
+  # ---- H1：设备注册 ----
+  /devices/register:
+    post:
+      tags: [设备管理]
+      summary: 设备注册
+      description: |
+        注册新设备，获取 deviceId 和 deviceToken。
+        deviceToken 用于后续所有需要认证的端点。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '200':
+          description: 注册成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterResponse'
+
+  # ---- H1：设备心跳 ----
+  /devices/heartbeat:
+    post:
+      tags: [设备管理]
+      summary: 设备心跳
+      description: |
+        定期上报心跳，维持设备在线状态。
+        需要 Bearer token 认证，且 token 对应的 deviceId 须与请求体一致。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HeartbeatRequest'
+      responses:
+        '200':
+          description: 心跳成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HeartbeatResponse'
+        '401':
+          description: 认证失败（token 无效或 deviceId 不匹配）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ---- 设备快照（联调观测） ----
+  /devices:
+    get:
+      tags: [设备管理]
+      summary: 全量设备快照
+      description: 返回所有已注册设备的快照信息（联调观测用，不需要认证）。
+      security: []
+      responses:
+        '200':
+          description: 设备快照
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/DeviceSnapshot'
+                description: "key=deviceId, value=设备快照"
+
+  # ---- H2：元数据同步 ----
+  /namespace:
+    get:
+      tags: [元数据同步]
+      summary: 命名空间同步
+      description: |
+        拉取命名空间（目录树）元数据。
+
+        **全量拉取** (`since <= 0` 或不传)：返回所有活节点（不含墓碑），mode=full。
+        **增量拉取** (`since > 0`)：返回 version > since 的节点（含墓碑），mode=incremental。
+        客户端根据墓碑标记删除本地节点，根据活节点更新/新增本地节点。
+
+        P0-1 协议语义：
+        - 增量拉取返回的 `version` 必须 >= 客户端已同步游标，否则触发全量重拉。
+        - 禁止将游标写回退值（会导致数据永久陈旧）。
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+          description: |
+            增量拉取的版本游标。
+            - `since <= 0`（默认）：全量拉取
+            - `since > 0`：增量拉取（返回 version > since 的节点）
+      responses:
+        '200':
+          description: 命名空间元数据
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NamespaceResponse'
+        '401':
+          description: 认证失败
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ---- H4：分片下载 ----
+  /data/{nodeId}:
+    get:
+      tags: [数据下载]
+      summary: 文件内容下载（支持 Range 分片）
+      description: |
+        下载文件节点的二进制内容。
+
+        **无 Range 头**：返回完整文件内容（200 OK）。
+        **有 Range 头**：返回指定字节范围（206 Partial Content）。
+
+        响应头：
+        - `ETag`：文件 SHA-256（双引号包裹）
+        - `X-Content-Sha256`：文件 SHA-256（无引号）
+        - `Content-Range`：分片范围（仅 206 响应）
+        - `Accept-Ranges: bytes`：始终携带
+
+        P0-1 校验：客户端从 /namespace 元数据获取 sha256 期望值，
+        与 /data 响应头 X-Content-Sha256 比对，确保数据完整性。
+      parameters:
+        - name: nodeId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: 文件节点 ID
+        - name: Range
+          in: header
+          required: false
+          schema:
+            type: string
+            pattern: '^bytes=\d+-\d*$'
+          description: |
+            HTTP Range 请求头。
+            - `bytes=0-4095`：下载前 4096 字节
+            - `bytes=4096-`：从偏移 4096 到文件尾
+            - 不传：全量下载
+          example: "bytes=0-4095"
+      responses:
+        '200':
+          description: 完整文件内容
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: '"<sha256>"'
+            X-Content-Sha256:
+              schema:
+                type: string
+              description: 文件 SHA-256
+            Accept-Ranges:
+              schema:
+                type: string
+                enum: [bytes]
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '206':
+          description: 分片内容（Range 请求）
+          headers:
+            Content-Range:
+              schema:
+                type: string
+              description: "bytes <start>-<end>/<total>"
+            ETag:
+              schema:
+                type: string
+            X-Content-Sha256:
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                type: string
+                enum: [bytes]
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: 认证失败
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 节点不存在或已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: 节点不是文件类型
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '416':
+          description: Range 请求超出文件大小
+          headers:
+            Content-Range:
+              schema:
+                type: string
+              description: "bytes */<total>"
+            X-Content-Sha256:
+              schema:
+                type: string
+
+  # ---- 管理端点：节点删除（P0-1 墓碑语义） ----
+  /admin/namespace/delete:
+    post:
+      tags: [管理]
+      summary: 节点墓碑删除
+      description: |
+        将指定节点及其所有子节点标记为 `deleted=true`（墓碑模式），
+        推进全局版本号一次，所有受影响节点绑定同一版本。
+        客户端下次增量拉取将收到墓碑并执行本地删除。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteRequest'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteResponse'
+        '404':
+          description: 节点不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ---- 管理端点：版本回退（P0-1 游标保护用例） ----
+  /admin/namespace/rollback:
+    post:
+      tags: [管理]
+      summary: 命名空间版本回退
+      description: |
+        模拟服务端版本回退（如降级/重置后全局版本倒退）。
+        客户端下次增量拉取将看到 `resp.version < since`，
+        须触发全量重拉（清库 + 全量拉取），禁止将游标写回退值。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RollbackRequest'
+      responses:
+        '200':
+          description: 回退成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RollbackResponse'
+
+  # ---- 健康检查 ----
+  /health:
+    get:
+      tags: [运维]
+      summary: 健康检查
+      description: 返回服务状态和基本统计信息。
+      security: []
+      responses:
+        '200':
+          description: 服务正常
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
