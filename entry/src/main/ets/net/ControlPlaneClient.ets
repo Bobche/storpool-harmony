@@ -18,6 +18,12 @@ import { util } from '@kit.ArkTS';
  *   - 统一超时配置（connectMs=5000, transferMs=5000）
  *   - 401 自愈语义完全保留（HttpError.statusCode 不变）
  *   - 协议契约以 docs/openapi.yaml 为单一事实源
+ *
+ * Session 生命周期修复（round 4）：
+ *   - Session 改为模块级共享缓存（Map<baseUrl, Session>），惰性创建、跨实例复用
+ *   - 调用方 `new ControlPlaneClient(url)` 不再创建/泄漏 Session——三处调用点零改动生效
+ *   - close() 改为从缓存移除并关闭该 baseUrl 的 Session（保留方法名，兼容现有无 close 调用）
+ *   - POST body 显式 JSON.stringify 传 string，避免隐式序列化不确定行为
  */
 export interface RegisterResponse {
   deviceId: string;
@@ -75,11 +81,20 @@ export interface NamespaceResponse {
 const TIMEOUT_CONNECT_MS = 5000;
 const TIMEOUT_TRANSFER_MS = 5000;
 
-export class ControlPlaneClient {
-  private session: rcp.Session;
+/**
+ * 模块级 Session 缓存：key=baseUrl，value=rcp.Session
+ *
+ * 惰性创建、跨 ControlPlaneClient 实例复用——三处 `new ControlPlaneClient(url)`
+ * 调用点（Index.ets 注册/心跳、NamespaceBrowser.ets）共享同一 Session，
+ * 构造/丢弃临时 client 不再创建/泄漏 Session。
+ */
+const sessionCache: Map<string, rcp.Session> = new Map();
 
-  constructor(baseUrl: string) {
-    this.session = rcp.createSession({
+/** 从缓存获取或惰性创建 Session（跨 ControlPlaneClient 实例复用） */
+function getOrCreateSession(baseUrl: string): rcp.Session {
+  let session: rcp.Session | undefined = sessionCache.get(baseUrl);
+  if (session === undefined) {
+    session = rcp.createSession({
       baseAddress: baseUrl,
       requestConfiguration: {
         transfer: {
@@ -90,18 +105,38 @@ export class ControlPlaneClient {
         },
       },
     });
+    sessionCache.set(baseUrl, session);
+  }
+  return session;
+}
+
+export class ControlPlaneClient {
+  private baseUrl: string;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl;
+    // 不再在构造函数中创建 Session——改为模块级缓存惰性创建，避免临时实例泄漏
   }
 
-  /** 关闭 Session，释放连接资源 */
+  /**
+   * 关闭并移除当前 baseUrl 对应的 Session
+   *
+   * 从缓存移除并关闭该 key 的 Session，后续请求将惰性创建新 Session。
+   * 保留方法名供测试/退出场景；现有调用点无 close()，兼容无碍。
+   */
   close(): void {
-    this.session.close();
+    const session: rcp.Session | undefined = sessionCache.get(this.baseUrl);
+    if (session !== undefined) {
+      session.close();
+      sessionCache.delete(this.baseUrl);
+    }
   }
 
   /**
    * 发送 POST 请求（内部统一方法）
    *
    * @param path API 路径（如 '/devices/register'）
-   * @param body 请求体对象（将作为 JSON 发送）
+   * @param body 请求体对象（显式 JSON.stringify 后作为 string 发送）
    * @param token 可选的 Bearer token
    * @returns 解析后的 JSON 响应对象
    * @throws HttpError 当响应状态码非 200 时
@@ -111,8 +146,10 @@ export class ControlPlaneClient {
     if (token !== undefined && token.length > 0) {
       headers['authorization'] = `Bearer ${token}`;
     }
-    const request: rcp.Request = new rcp.Request(path, 'POST', headers, body);
-    const resp: rcp.Response = await this.session.fetch(request);
+    const bodyStr: string = JSON.stringify(body);
+    const request: rcp.Request = new rcp.Request(path, 'POST', headers, bodyStr);
+    const session: rcp.Session = getOrCreateSession(this.baseUrl);
+    const resp: rcp.Response = await session.fetch(request);
     if (resp.statusCode !== 200) {
       throw new HttpError(resp.statusCode, path);
     }
@@ -130,7 +167,8 @@ export class ControlPlaneClient {
   private async getJson(path: string, token: string): Promise<object> {
     const headers: rcp.RequestHeaders = { 'authorization': `Bearer ${token}` };
     const request: rcp.Request = new rcp.Request(path, 'GET', headers);
-    const resp: rcp.Response = await this.session.fetch(request);
+    const session: rcp.Session = getOrCreateSession(this.baseUrl);
+    const resp: rcp.Response = await session.fetch(request);
     if (resp.statusCode !== 200) {
       throw new HttpError(resp.statusCode, path);
     }
