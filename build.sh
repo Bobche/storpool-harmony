@@ -8,7 +8,8 @@
 #   ./build.sh --rust     # 仅编译 Rust + 复制 .so
 #   ./build.sh --hap      # 仅构建 HAP（需先有 .so）
 #   ./build.sh --clean    # 清理 Rust target 后重新编译
-#   ./build.sh --check    # OpenAPI 契约一致性检查（tools/contract_check.py，fail → 非零退出）
+#   ./build.sh --check    # OpenAPI 契约一致性检查（tools/contract_check.py，fail → 非零）
+#   ./build.sh --doctor  # 三机环境自诊断（输出 build/doctor-report.md）
 #
 # 前置依赖：
 #   - Rust 工具链 + ohos 目标（rustup target add aarch64-unknown-linux-ohos x86_64-unknown-linux-ohos）
@@ -273,6 +274,150 @@ run_contract_check() {
     python "${check_script}"
 }
 
+# ---- 三机环境自诊断（round 6） ----
+# 输出标准化对比报告，换机排障 = diff 三份报告。
+# 退出码：关键项（python/git/仓库完整性）缺损 → 非零；工具类缺失仅 INFO。
+doctor() {
+    log_info "三机环境自诊断..."
+
+    # 仓库根（SCRIPT_DIR 即 build.sh 所在目录）
+    local repo_root="${SCRIPT_DIR}"
+    local report="${repo_root}/build/doctor-report.md"
+    mkdir -p "$(dirname "${report}")"
+
+    # 收集项
+    local items=()
+    local status_pass=0
+    local status_info=0
+    local status_miss=0
+
+    # 工具：探测并记录，返回状态 PASS/INFO/MISS
+    add_item() {
+        items+=("$1|$2|$3")
+        case "$3" in
+            PASS) status_pass=$((status_pass + 1)) ;;
+            INFO) status_info=$((status_info + 1)) ;;
+            MISS) status_miss=$((status_miss + 1)) ;;
+        esac
+    }
+
+    # ---- OS / hostname ----
+    local os_name="$(uname -s 2>/dev/null || echo unknown)"
+    local host_name="$(hostname 2>/dev/null || echo unknown)"
+    add_item "OS" "${os_name}" "INFO"
+    add_item "hostname" "${host_name}" "INFO"
+
+    # ---- Python ----
+    local py_ver=""
+    if command -v python &>/dev/null; then
+        py_ver="$(python --version 2>&1 || echo 'unknown')"
+        add_item "python" "${py_ver}" "PASS"
+    else
+        add_item "python" "NOT FOUND" "MISS"
+    fi
+
+    # ---- Git ----
+    if command -v git &>/dev/null; then
+        local git_ver="$(git --version 2>/dev/null || echo unknown)"
+        add_item "git" "${git_ver}" "PASS"
+        local ac="$(git config --get core.autocrlf 2>/dev/null || echo unset)"
+        add_item "git config core.autocrlf" "${ac}" "INFO"
+        local sslb="$(git config --get http.sslBackend 2>/dev/null || echo unset)"
+        add_item "git config http.sslBackend" "${sslb}" "INFO"
+        local proxy="$(git config --get http.proxy 2>/dev/null || echo unset)"
+        add_item "git config http.proxy" "${proxy:-unset}" "INFO"
+    else
+        add_item "git" "NOT FOUND" "MISS"
+    fi
+
+    # ---- devecocli ----
+    if command -v devecocli &>/dev/null; then
+        local dc_ver="$(devecocli --version 2>/dev/null || echo unknown)"
+        add_item "devecocli" "${dc_ver}" "PASS"
+    else
+        add_item "devecocli" "NOT FOUND (npm install -g @deveco/deveco-cli)" "MISS"
+    fi
+
+    # ---- DevEco 三路径探测（复用既有函数） ----
+    local deveco_found=""
+    if detect_deveco_home 2>/dev/null; then
+        deveco_found="${DEVECO_HOME}"
+        add_item "DevEco Studio" "${deveco_found}" "PASS"
+    else
+        add_item "DevEco Studio" "NOT FOUND" "MISS"
+    fi
+
+    # ---- hdc 可达性 ----
+    if command -v hdc &>/dev/null; then
+        local hdc_targets="$(hdc list targets 2>/dev/null | grep -v "^$" || echo empty)"
+        local hdc_count=$(echo "${hdc_targets}" | grep -c . 2>/dev/null || echo 0)
+        add_item "hdc targets" "${hdc_count} device(s)" "INFO"
+    else
+        add_item "hdc" "NOT FOUND (DevEco SDK toolchains)" "INFO"
+    fi
+
+    # ---- cargo（缺失仅 INFO——机器角色不同） ----
+    if command -v cargo &>/dev/null; then
+        local cr="$(cargo --version 2>/dev/null || echo unknown)"
+        add_item "cargo" "${cr}" "INFO"
+    else
+        add_item "cargo" "NOT FOUND" "INFO"
+    fi
+
+    # ---- node ----
+    if command -v node &>/dev/null; then
+        local nv="$(node --version 2>/dev/null || echo unknown)"
+        add_item "node" "${nv}" "INFO"
+    else
+        add_item "node" "NOT FOUND" "INFO"
+    fi
+
+    # ---- entry/libs 双 ABI .so 存在性与字节数 ----
+    local arm64_so="${repo_root}/entry/libs/arm64-v8a/libstorpool_napi.so"
+    local x86_64_so="${repo_root}/entry/libs/x86_64/libstorpool_napi.so"
+    if [[ -f "${arm64_so}" ]]; then
+        add_item "entry/libs/arm64-v8a/libstorpool_napi.so" "$(wc -c < "${arm64_so}") bytes" "INFO"
+    else
+        add_item "entry/libs/arm64-v8a/libstorpool_napi.so" "NOT FOUND" "INFO"
+    fi
+    if [[ -f "${x86_64_so}" ]]; then
+        add_item "entry/libs/x86_64/libstorpool_napi.so" "$(wc -c < "${x86_64_so}") bytes" "INFO"
+    else
+        add_item "entry/libs/x86_64/libstorpool_napi.so" "NOT FOUND" "INFO"
+    fi
+
+    # ---- 写报告 ----
+    {
+        echo "# StorPool HarmonyOS — 三机环境自诊断报告"
+        echo ""
+        echo "生成时间: $(date '+%Y-%m-%dT%H:%M:%S')"
+        echo "仓库根: ${repo_root}"
+        echo ""
+        echo "| 项 | 值 | 状态 |"
+        echo "|---|---|---|"
+        local IFS='|'
+        for entry in "${items[@]}"; do
+            read -r key val status <<< "${entry}"
+            echo "| ${key} | ${val} | ${status} |"
+        done
+        echo ""
+        echo "汇总: ${status_pass} PASS / ${status_info} INFO / ${status_miss} MISS"
+        if [[ ${status_miss} -gt 0 ]]; then
+            echo ""
+            echo "> 关键项缺损（MISS），请按上表排查。"
+        fi
+    } > "${report}"
+
+    log_info "  报告: ${report}"
+    log_info "  汇总: ${status_pass} PASS / ${status_info} INFO / ${status_miss} MISS"
+
+    # 关键项缺损 → 非零退出
+    if [[ ${status_miss} -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
 # ---- 主流程 ----
 main() {
     local mode="${1:-all}"
@@ -294,13 +439,16 @@ main() {
         --check)
             run_contract_check
             ;;
+        --doctor)
+            doctor || exit $?
+            ;;
         all|"")
             check_env
             build_rust
             build_hap
             ;;
         *)
-            echo "用法: $0 [--rust|--hap|--clean|--check]"
+            echo "用法: $0 [--rust|--hap|--clean|--check|--doctor]"
             exit 1
             ;;
     esac
