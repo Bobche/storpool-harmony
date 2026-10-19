@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """P1-13 长稳 soak — rcp Session 缓存无泄漏运行期证明（round 5 · 机器 C）
+round 6（P2-6）扩展：判定门参数化（--gates，arkts 默认纳入）+ 阶段 C 静置
+观察段（--settle，判 ArkTS GC 惰性 vs 真泄漏）——arkts heap +62% 观察项深挖。
 
 背景：feat/rcp-session（07c71a8，已合入 main）把 ControlPlaneClient 的
 rcp.Session 改为模块级共享缓存 Map<baseUrl, Session>（惰性创建、close()
@@ -8,7 +10,7 @@ rcp.Session 改为模块级共享缓存 Map<baseUrl, Session>（惰性创建、c
 全部跑在旧 http 实现上，本脚本在 rcp 实现基线上为「Session 缓存无泄漏」
 提供运行期证据，同时是任务指令 P1-13 的交付物。
 
-编排（两阶段，先 A 后 B；任务指令要求先闭环 P1-11 再跑本脚本）：
+编排（先 A 后 B，可选 C；任务指令要求先闭环 P1-11 再跑本脚本）：
   阶段 A（心跳 soak）：App 注册后保持运行 --minutes 分钟（默认 10），
       每 --sample-every 秒（默认 30）采样：pidof → hidumper --mem <pid>
       → PSS / native heap / ark ts heap + server heartbeatCount（活性旁证）。
@@ -20,14 +22,23 @@ rcp.Session 改为模块级共享缓存 Map<baseUrl, Session>（惰性创建、c
       1 次，本阶段反复 --ui-loops 轮，默认 10）。注：App 的「重新注册」
       按钮实为 ensureRegistration（本地身份复用，不发 register），
       不构成 Session 重建路径，故不采用（2026-10-19 实测）。
+  阶段 C（静置观察，P2-6 新增，--settle 秒 >0 启用）：阶段 B 结束后
+      不做任何 UI 操作，继续按 --sample-every 采样。用于区分「阶段 B 的
+      arkts 每轮 +575kB 线性增长」是 GC 惰性（静置后回落/走平）还是
+      真保留（不回落）。不入主判定门，仅作定性证据输出。
 
-判定门（任务指令原文口径）：PSS 首末差 + 增长趋势；>20% 单调上升 →
-标记「疑似 Session 泄漏」，附复现路径回报，不修码（net/** 归 B）。
+判定门（P2-6 参数化）：--gates pss,native,arkts（默认全开）。规则与
+PSS 同源：>20% 涨幅 ∧ 后半均值>前半×1.15 ∧ 斜率正 → 疑似泄漏。
+arkts 门命中 ≠ 定性结论——ArkTS 堆有预热/GC 惰性，最终定性
+（warmup_converged / suspected_leak）需结合多 run 终值对照与静置段
+形态人工裁决（分析见任务回报）。
 
 用法：
   python e2e/soak.py                          # 10min 心跳 + 10 轮自愈循环
   python e2e/soak.py --minutes 12 --ui-loops 20
   python e2e/soak.py --sample-every 20        # 加密采样
+  python e2e/soak.py --settle 120             # 阶段 B 后静置观察 2min
+  python e2e/soak.py --gates pss,native       # arkts 只观测不入门
   python e2e/soak.py --json e2e/logs/soak.json
   python e2e/soak.py --skip-build             # 复用已有 HAP
 
@@ -261,14 +272,29 @@ def main() -> int:
                     help='阶段 A 采样间隔（秒，默认 30 ≈ 每 2 拍心跳）')
     ap.add_argument('--ui-loops', type=int, default=10,
                     help='阶段 B 401 自愈循环轮数（默认 10）')
+    ap.add_argument('--gates', default='pss,native,arkts',
+                    help='泄漏判定门指标，逗号分隔 pss,native,arkts'
+                         '（默认全开；未列出的指标仍采样/分析，只是不入'
+                         '泄漏判定）')
+    ap.add_argument('--settle', type=int, default=0,
+                    help='阶段 C 静置观察时长（秒，默认 0 不跑；建议 120，'
+                         '判阶段 B arkts 增长是 GC 惰性还是真保留）')
     ap.add_argument('--serial', help='hdc 目标（多设备必填）')
     ap.add_argument('--hap', help='覆盖默认 HAP 路径')
     ap.add_argument('--skip-build', action='store_true', help='复用已有 HAP')
     ap.add_argument('--json', dest='json_out', help='JSON 报告输出路径')
     args = ap.parse_args()
 
+    gates = {g.strip().lower() for g in args.gates.split(',') if g.strip()}
+    unknown = gates - {'pss', 'native', 'arkts'}
+    if unknown:
+        print(f'✗ --gates 含未知指标: {",".join(sorted(unknown))}'
+              f'（可用：pss,native,arkts）')
+        return 2
     print(f'StorPool soak（P1-13）— {args.minutes}min 心跳 + '
-          f'{args.ui_loops} 轮 401 自愈循环，采样间隔 {args.sample_every}s')
+          f'{args.ui_loops} 轮 401 自愈循环，采样间隔 {args.sample_every}s，'
+          f'判定门 [{",".join(g for g in ("pss", "native", "arkts") if g in gates)}]'
+          + (f'，静置观察 {args.settle}s' if args.settle > 0 else ''))
 
     # ---- 设备 ----
     hdc = Hdc.pick(args.serial)
@@ -385,16 +411,55 @@ def main() -> int:
                 break
             time.sleep(3)
 
+        # ---- 阶段 C：静置观察（P2-6，--settle >0 启用）----
+        # 阶段 B 结束后不做任何 UI 操作，继续采样：arkts 若在静置期
+        # 回落/走平 → GC 惰性佐证；维持高位不落 → 真保留嫌疑。
+        samples_c: list[dict] = []
+        if args.settle > 0:
+            print(f'\n== 阶段 C：静置观察（{args.settle}s，无 UI 操作）==')
+            c_end = time.time() + args.settle
+            c_next = time.time()
+            while True:
+                now = time.time()
+                if now >= c_end:
+                    break
+                pid = app_pid(hdc)
+                if pid is None:
+                    print('  ⚠ [C] pidof 未命中（App 可能被杀）')
+                else:
+                    mem = sample_memory(hdc, pid)
+                    rec = {'t': round(now - t0, 1), 'pid': pid,
+                           'hb': hb_max(srv)}
+                    rec.update(mem or {'pss_kb': -1, 'native_heap_kb': -1,
+                                       'ark_ts_heap_kb': -1})
+                    samples_c.append(rec)
+                    print(f'  [C t={rec["t"]:>6.0f}s] pss={rec["pss_kb"]}kB '
+                          f'native={rec["native_heap_kb"]}kB '
+                          f'arkts={rec["ark_ts_heap_kb"]}kB hb={rec["hb"]}')
+                c_next += args.sample_every
+                time.sleep(max(0.0, min(c_next - time.time(),
+                                        c_end - time.time())))
+
         # ---- 分析与结论 ----
         total_s = time.time() - t0
         # pid 变化会重置基线 → 以最长稳定 pid 段分析
         seg = _longest_pid_segment(samples_a)
-        ana_a = analyze(seg)
-        ana_a_native = analyze(seg, 'native_heap_kb')
-        ana_b = analyze([s for s in samples_b if s.get('pss_kb', -1) > 0])
+        seg_b = [s for s in samples_b if s.get('pss_kb', -1) > 0]
+        seg_c = [s for s in samples_c if s.get('pss_kb', -1) > 0]
         print_table(f'阶段 A（pid={seg[0].get("pid") if seg else "-"} 稳定段）', seg)
-        print_table('阶段 B（UI 循环）',
-                    [s for s in samples_b if s.get('pss_kb', -1) > 0])
+        print_table('阶段 B（401 自愈循环）', seg_b)
+        if seg_c:
+            print_table('阶段 C（静置观察）', seg_c)
+
+        # 判定门指标 ×（阶段 A/B/C）全分析；--gates 只过滤「入泄漏判定」
+        # 的项，未入门指标仍采样/分析（观测口径不变，退出码不受影响）。
+        METRICS = (('pss', 'pss_kb'), ('native', 'native_heap_kb'),
+                   ('arkts', 'ark_ts_heap_kb'))
+        analysis: dict = {}
+        for ph, seg_ph in (('phase_a', seg), ('phase_b', seg_b),
+                           ('phase_c', seg_c)):
+            for g, key in METRICS:
+                analysis[f'{ph}_{g}'] = analyze(seg_ph, key)
 
         def _fmt(tag: str, a: dict) -> str:
             if a.get('verdict') == 'insufficient_samples':
@@ -406,15 +471,45 @@ def main() -> int:
                     f'{a["first_half_avg_kb"]}）→ {a["verdict"]}')
 
         print('\n== 泄漏判定（门：>20% 涨幅 且 后半均值>前半×1.15 且 斜率>0）==')
-        print(_fmt('阶段A PSS      ', ana_a))
-        print(_fmt('阶段A native堆 ', ana_a_native))
-        print(_fmt('阶段B PSS      ', ana_b))
+        for ph, label in (('phase_a', '阶段A'), ('phase_b', '阶段B'),
+                          ('phase_c', '阶段C静置')):
+            if ph == 'phase_c' and not seg_c:
+                continue
+            for g, glabel in (('pss', 'PSS     '), ('native', 'native堆'),
+                              ('arkts', 'arkts堆 ')):
+                mark = '' if g in gates else ' [仅观测未入门]'
+                print(_fmt(f'{label} {glabel}{mark}', analysis[f'{ph}_{g}']))
 
-        suspected = ('suspected_leak' in
-                     (ana_a.get('verdict'), ana_a_native.get('verdict'),
-                      ana_b.get('verdict')))
-        verdict = '疑似 Session 泄漏（回报 A 仲裁，不改码）' if suspected \
-            else '无泄漏证据（PSS/native 堆均在判定门内）'
+        # 主判定只看压力段（A/B）；静置段 C 是定性证据不入门
+        suspected_hits = [f'{ph}.{g}'
+                          for ph in ('phase_a', 'phase_b')
+                          for g in ('pss', 'native', 'arkts')
+                          if g in gates
+                          and analysis.get(f'{ph}_{g}', {}).get('verdict')
+                          == 'suspected_leak']
+        suspected = bool(suspected_hits)
+        verdict = (f'疑似泄漏（门命中: {",".join(suspected_hits)}；'
+                   '回报 A 仲裁，不改码）' if suspected
+                   else '无泄漏证据（判定门指标均在门内）')
+
+        # 静置段定性：阶段 B 末 → 静置末 的 arkts 变化（GC 惰性判别）
+        settle_note = ''
+        if seg_b and seg_c:
+            def _last_valid(seq: list[dict], key: str) -> int | None:
+                for s in reversed(seq):
+                    if s.get(key, -1) > 0:
+                        return s[key]
+                return None
+            b_end = _last_valid(seg_b, 'ark_ts_heap_kb')
+            c_end = _last_valid(seg_c, 'ark_ts_heap_kb')
+            if b_end and c_end:
+                pct = (c_end - b_end) / b_end * 100
+                form = ('回落' if c_end < b_end
+                        else ('走平' if pct < 5 else '继续上涨'))
+                settle_note = (f'阶段B末 arkts={b_end}kB → 静置末 {c_end}kB'
+                               f'（{pct:+.1f}%，{form}；'
+                               + ('GC 惰性佐证' if pct < 5 else '真保留嫌疑')
+                               + '）')
         hb_expect_a = max(1, int(t_a / HEARTBEAT_INTERVAL_S))
         hb_ok = hb_final_a >= base_hb + max(1, hb_expect_a - 2)
         print(f'\n== 结论 ==')
@@ -425,6 +520,8 @@ def main() -> int:
         print(f'  阶段B 自愈循环: {loop_stat["note"]}；循环后心跳恢复: '
               f'{"✓" if hb_recovered else "✗"}')
         print(f'  pid 变化: {pid_changes} 次（0 = App 全程存活）')
+        if settle_note:
+            print(f'  静置观察: {settle_note}')
         print(f'  泄漏判定: {verdict}')
 
         # ---- JSON 报告 ----
@@ -435,15 +532,16 @@ def main() -> int:
                 'phase_a_s': round(t_a, 1),
                 'minutes': args.minutes, 'sample_every': args.sample_every,
                 'ui_loops': args.ui_loops, 'pid_changes': pid_changes,
+                'gates': sorted(gates), 'settle_s': args.settle,
                 'hb_base': base_hb, 'hb_final_a': hb_final_a, 'hb_ok': hb_ok,
                 'hb_recovered_after_b': hb_recovered,
+                'settle_note': settle_note,
                 'ui_loop': loop_stat, 'verdict': verdict,
             },
             'phase_a_samples': samples_a,
             'phase_b_samples': samples_b,
-            'analysis': {'phase_a_pss': ana_a,
-                         'phase_a_native_heap': ana_a_native,
-                         'phase_b_pss': ana_b},
+            'phase_c_samples': samples_c,
+            'analysis': analysis,
         }
         if args.json_out:
             os.makedirs(os.path.dirname(os.path.abspath(args.json_out)),
@@ -458,6 +556,9 @@ def main() -> int:
         except HdcError:
             pass
         ok_all = not suspected and hb_ok and hb_recovered
+        # 注：arkts 门命中（GC 惰性可能误报）时退出码为 1 属预期——
+        # 最终定性（warmup_converged/suspected_leak）以任务回报的
+        # 多 run 对照 + 静置段形态分析为准，勿只看退出码。
         return 0 if ok_all else 1
     finally:
         srv.stop()
