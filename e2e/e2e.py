@@ -246,7 +246,19 @@ def expected_report_sha256() -> str:
 
 
 def wait_for(ui: UiTree, pattern, timeout=20, poll=1.5):
-    """轮询 dump 直到文本正则命中（可见），返回首个命中节点，超时 None"""
+    """轮询 dump 直到文本正则命中（可见），返回首个命中节点，超时 None
+
+    ⚠ P2-8 锚定审计注记（2026-10-19，round6）：
+    本函数是**存在性等待**——只认「文本出现过」，不区分本轮/遗留。
+    安全前提 = 断言点处于「卸载重装 + 单次流程」结构（phase_device 全部
+    断言点满足：uninstall→install→aa start 后 UI 全新，无旧文案残留路径）。
+    **多轮循环场景（401 自愈循环、soak 阶段 B 等）禁止直接用本函数等待
+    注册类文案**——旧轮文案残留会立即误匹配（soak r5 实锤的「滞后一轮」
+    陷阱）。必须用 heal401._wait_re_register 式锚定：serverTime 严格大于
+    本轮基准值才认。注入测试见 round6 交付（4/4：锚定拒绝旧值/返回新值/
+    存在性误匹配对照/基数=0 退化对照）。真机实证：heal401 场景注册文案
+    为覆盖形态（单槽位更新），锚定系无害兜底。
+    """
     rx = re.compile(pattern)
     deadline = time.time() + timeout
     while time.time() < deadline:
