@@ -282,6 +282,31 @@ def main() -> None:
     check('空 deviceName → 400', code == 400,
           f"status={code} error={err.get('error', '')[:40]}")
 
+    # ---------- H4 Range 协议层负例（round 6） ----------
+    # 28. 开放 Range bytes=0- → 206 到文件尾（Content-Range 含起始位置）
+    code, hdr, body = req_raw('GET', '/data/8', token=tok, range_header='bytes=0-')
+    check('开放 Range bytes=0- → 206 到文件尾', code == 206
+          and len(body) == 819200
+          and hdr.get('Content-Range', '').startswith('bytes 0-'),
+          f'status={code} len={len(body)}B Content-Range={hdr.get("Content-Range","")}')
+
+    # 29. 越界 Range bytes=99999999- → 416 + Content-Range bytes */total
+    code, hdr, _ = req_raw('GET', '/data/8', token=tok, range_header='bytes=99999999-')
+    cr = hdr.get('Content-Range', '')
+    check('越界 Range → 416 + bytes */total', code == 416
+          and cr.startswith('bytes */'),
+          f'status={code} Content-Range={cr}')
+
+    # 30. 目录节点 → 400（与用例 17 同语义，独立覆盖）
+    code, _, _ = req_raw('GET', '/data/1', token=tok)
+    check('目录节点 → 400（round 6 独立覆盖）', code == 400,
+          f'status={code}')
+
+    # 31. 不存在节点 → 404
+    code, _, _ = req_raw('GET', '/data/9999', token=tok)
+    check('不存在节点 → 404（round 6 独立覆盖）', code == 404,
+          f'status={code}')
+
     print(f'\n结果：{len(passed)} passed, {len(failed)} failed')
     sys.exit(0 if not failed else 1)
 

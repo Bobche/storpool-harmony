@@ -244,6 +244,28 @@ def find_free_port():
     raise RuntimeError("找不到空闲端口")
 
 
+def http_raw(base_url, method, path, headers=None, timeout=10):
+    """发送 HTTP 请求，返回 (status_code, response_headers, raw_body_bytes)。
+
+    与 http_request 的区别：保留原始二进制 body（/data 端点精确长度断言用）；
+    headers 同样转为大小写不敏感 dict（round 6 协议面负例专用）。
+    """
+    url = base_url + path
+    req = urllib.request.Request(url, method=method)
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            return status, resp_headers, resp.read()
+    except urllib.error.HTTPError as e:
+        status = e.code
+        resp_headers = {k.lower(): v for k, v in e.headers.items()}
+        return status, resp_headers, e.read()
+
+
 # ---- 契约检查用例 ----
 def run_checks(base_url, endpoints, schemas_required):
     """逐端点按契约发起请求验证"""
@@ -420,6 +442,18 @@ def run_checks(base_url, endpoints, schemas_required):
     # ========== GET /data/{nodeId} ==========
     if "/data/{nodeId}" in endpoints and "get" in endpoints["/data/{nodeId}"]:
         if device_token:
+            # 预取 /namespace 元数据（取 node=3 的 sha256，供后续 sha 比对断言用）
+            ns_status, ns_resp, _ = http_request(
+                base_url, "GET", "/namespace?since=0",
+                headers={"Authorization": f"Bearer {device_token}"},
+            )
+            meta_sha = ''
+            if ns_status == 200 and isinstance(ns_resp, dict):
+                for n in ns_resp.get('nodes', []):
+                    if isinstance(n, dict) and n.get('id') == 3:
+                        meta_sha = n.get('sha256', '')
+                        break
+
             # 正例：全量下载（无 Range）
             name = "GET /data/3 -- 正例（全量下载）"
             status, resp, headers = http_request(
@@ -453,6 +487,78 @@ def run_checks(base_url, endpoints, schemas_required):
                     ok = False; detail += ", missing Content-Range"
                 else:
                     detail = "status=206, Content-Range present"
+            record(name, ok, detail)
+
+            # ---- Range 语法族负例 ----
+            # 负例：开放 Range bytes=0- -> 206 到文件尾
+            name = "GET /data/3 -- 负例（开放 Range bytes=0-）"
+            status, hdr, body = http_raw(
+                base_url, "GET", "/data/3",
+                headers={"Authorization": f"Bearer {device_token}",
+                         "Range": "bytes=0-"},
+            )
+            ok = status in (200, 206)
+            detail = f"status={status} len={len(body)}B"
+            if ok and status == 206:
+                cr = hdr.get('content-range', '')
+                if not cr.startswith('bytes 0-'):
+                    ok = False; detail += f", unexpected Content-Range: {cr}"
+            record(name, ok, detail)
+
+            # 负例：越界 Range bytes=99999999- -> 416 + Content-Range bytes */total
+            name = "GET /data/3 -- 负例（越界 Range -> 416）"
+            status, hdr, body = http_raw(
+                base_url, "GET", "/data/3",
+                headers={"Authorization": f"Bearer {device_token}",
+                         "Range": "bytes=99999999-"},
+            )
+            ok = status == 416
+            detail = f"status={status}"
+            if ok:
+                cr = hdr.get('content-range', '')
+                if not cr.startswith('bytes */'):
+                    ok = False; detail += f", missing Content-Range bytes */total: {cr}"
+                else:
+                    detail = f"status=416, Content-Range={cr}"
+            record(name, ok, detail)
+
+            # 负例：目录节点 -> 400
+            name = "GET /data/1 -- 负例（目录节点 -> 400）"
+            status, _, _ = http_request(
+                base_url, "GET", "/data/1",
+                headers={"Authorization": f"Bearer {device_token}"},
+            )
+            ok = status == 400
+            record(name, ok, f"status={status}")
+
+            # 负例：不存在节点 -> 404
+            name = "GET /data/9999 -- 负例（不存在节点 -> 404）"
+            status, _, _ = http_request(
+                base_url, "GET", "/data/9999",
+                headers={"Authorization": f"Bearer {device_token}"},
+            )
+            ok = status == 404
+            record(name, ok, f"status={status}")
+
+            # 正例：sha256 与元数据比对（ETag 引号包裹容忍）
+            name = "GET /data/3 -- 正例（sha256 与元数据比对）"
+            status, hdr, _ = http_raw(
+                base_url, "GET", "/data/3",
+                headers={"Authorization": f"Bearer {device_token}"},
+            )
+            ok = status == 200
+            detail = f"status={status}"
+            if ok:
+                header_sha = (hdr.get('x-content-sha256') or '').strip()
+                etag_val = (hdr.get('etag') or '').strip().replace('"', '')
+                if not header_sha:
+                    ok = False; detail += ", missing X-Content-Sha256"
+                elif meta_sha and header_sha != meta_sha:
+                    ok = False; detail += f", sha mismatch: {header_sha[:12]} vs meta {meta_sha[:12]}"
+                elif etag_val and etag_val != header_sha:
+                    ok = False; detail += f", ETag({etag_val[:12]}) != sha256({header_sha[:12]})"
+                else:
+                    detail = f"status=200, sha256 match meta={meta_sha[:12]} ETag stripped={etag_val[:12]}"
             record(name, ok, detail)
         else:
             record("GET /data/{nodeId} -- 正例", False, "注册失败，无 token")
@@ -585,7 +691,7 @@ def main():
     proc = subprocess.Popen(
         [sys.executable, MOCK_SERVER_PATH, str(port)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        cwd=os.path.dirname(MOCK_SERVER_PATH),
+        cwd=PROJECT_ROOT,  # 仓库根（MOCK_SERVER_PATH 已是相对路径）
     )
 
     try:
