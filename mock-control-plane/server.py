@@ -3,6 +3,8 @@
 
 对应规划中的控制面 API（正式实现为 Go 侧另仓库，本 mock 覆盖 H1/H2 所需端点）：
   POST /devices/register   {deviceName, platform}          -> {deviceId, deviceToken, serverTime}
+        契约校验（round 5）：RegisterRequest required=[deviceName, platform]
+        （openapi.yaml 单一事实源）；缺失/空值/非字符串返回 400 + ErrorResponse 语义 body
   POST /devices/heartbeat  {deviceId} (Bearer deviceToken) -> {status, serverTime}
   GET  /devices            -> 全量设备快照（联调观测用）
   GET  /namespace[?since=N] (Bearer deviceToken)           -> {version, mode, nodes}  H2 元数据
@@ -204,12 +206,25 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         payload = self._read_body()
         if self.path == '/devices/register':
+            # 契约校验（round 5）：RegisterRequest required=[deviceName, platform]
+            # （openapi.yaml 单一事实源）。缺失（key 不存在/JSON null）、空值、
+            # 非字符串类型均返回 400 + ErrorResponse 语义 body（契约 required=[error]）。
+            device_name = payload.get('deviceName')
+            platform = payload.get('platform')
+            if not isinstance(device_name, str) or not device_name.strip():
+                self._json(400, {'error': 'deviceName (non-empty string) is required',
+                                 'serverTime': now_ms()})
+                return
+            if not isinstance(platform, str) or not platform.strip():
+                self._json(400, {'error': 'platform (non-empty string) is required',
+                                 'serverTime': now_ms()})
+                return
             device_id = 'dev-' + uuid.uuid4().hex[:12]
             token = 'tok-' + uuid.uuid4().hex[:16]
             with LOCK:
                 DEVICES[device_id] = {
-                    'deviceName': str(payload.get('deviceName', 'unknown')),
-                    'platform': str(payload.get('platform', 'unknown')),
+                    'deviceName': device_name,
+                    'platform': platform,
                     'capabilities': payload.get('capabilities', []),
                     'token': token,
                     'registeredAt': now_ms(),
@@ -217,8 +232,8 @@ class Handler(BaseHTTPRequestHandler):
                     'heartbeatCount': 0,
                 }
                 TOKENS[token] = device_id
-            print(f'[register] {device_id} name={payload.get("deviceName")} '
-                  f'platform={payload.get("platform")}')
+            print(f'[register] {device_id} name={device_name} '
+                  f'platform={platform}')
             self._json(200, {
                 'deviceId': device_id,
                 'deviceToken': token,

@@ -29,6 +29,10 @@
   22. 块+1B（131073B）：末片 1B + 两片重组 == 全量
   23. sha256Override 篡改：元数据 sha ≠ 响应头真实 sha（客户端负向检出依据）
   24. 增量拉取发现全部注入节点（版本推进语义）
+  --- register 契约校验负例（round 5，required=[deviceName, platform]）---
+  25. 缺失 deviceName（platform 在）→ 400 + error body
+  26. 缺失 platform（deviceName 在）→ 400
+  27. 空字符串 deviceName → 400
 """
 import hashlib
 import json
@@ -258,6 +262,25 @@ def main() -> None:
     check('增量拉取发现 5 个注入节点', code == 200 and all_found and versions_ok,
           f'found={sorted(i for i in injected if i in inc_nodes)} '
           f'versions_ok={versions_ok}')
+
+    # ---------- register 契约校验负例（round 5）：required=[deviceName, platform] ----------
+    # 25. 缺失 deviceName（platform 在）→ 400 + error body（ErrorResponse 语义）
+    code, err = req('POST', '/devices/register', {'platform': 'pytest'})
+    check('缺 deviceName → 400 + error body', code == 400
+          and isinstance(err.get('error'), str) and 'deviceName' in err.get('error', ''),
+          f"status={code} error={err.get('error', '')[:40]}")
+
+    # 26. 缺失 platform（deviceName 在）→ 400
+    code, err = req('POST', '/devices/register', {'deviceName': 'selftest-neg'})
+    check('缺 platform → 400', code == 400
+          and isinstance(err.get('error'), str) and 'platform' in err.get('error', ''),
+          f"status={code} error={err.get('error', '')[:40]}")
+
+    # 27. 空字符串 deviceName → 400（契约 type: string 且非空）
+    code, err = req('POST', '/devices/register',
+                    {'deviceName': '   ', 'platform': 'pytest'})
+    check('空 deviceName → 400', code == 400,
+          f"status={code} error={err.get('error', '')[:40]}")
 
     print(f'\n结果：{len(passed)} passed, {len(failed)} failed')
     sys.exit(0 if not failed else 1)
