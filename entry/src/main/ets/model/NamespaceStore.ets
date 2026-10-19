@@ -38,8 +38,16 @@ export class NamespaceStore {
       type TEXT NOT NULL,
       size INTEGER NOT NULL DEFAULT 0,
       mtime INTEGER NOT NULL DEFAULT 0,
-      version INTEGER NOT NULL DEFAULT 0
+      version INTEGER NOT NULL DEFAULT 0,
+      sha256 TEXT NOT NULL DEFAULT ''
     )`);
+    // 既有库迁移（H4 后补 sha256 列）：列已存在时 ALTER 报错，忽略即可
+    try {
+      await this.store.executeSql(
+        `ALTER TABLE ${TABLE} ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''`);
+    } catch (_e) {
+      // duplicate column name — 已是新 schema，无需处理
+    }
     await this.store.executeSql(`CREATE INDEX IF NOT EXISTS idx_ns_parent ON ${TABLE}(parentId)`);
     await this.store.executeSql(`CREATE TABLE IF NOT EXISTS ${META_TABLE} (
       k TEXT PRIMARY KEY,
@@ -95,6 +103,7 @@ export class NamespaceStore {
             'size': n.size,
             'mtime': n.mtime,
             'version': n.version,
+            'sha256': n.sha256 ?? '',
           };
           await this.store.insert(TABLE, vb,
             relationalStore.ConflictResolution.ON_CONFLICT_REPLACE);
@@ -136,6 +145,7 @@ export class NamespaceStore {
           'size': n.size,
           'mtime': n.mtime,
           'version': n.version,
+          'sha256': n.sha256 ?? '',
         };
         await this.store.insert(TABLE, vb,
           relationalStore.ConflictResolution.ON_CONFLICT_REPLACE);
@@ -161,7 +171,7 @@ export class NamespaceStore {
       .orderByDesc('type')   // 'file' > 'dir' 字典序，desc 使 dir 在前
       .orderByAsc('name');
     const rs = await this.store.query(predicates,
-      ['id', 'parentId', 'name', 'type', 'size', 'mtime', 'version']);
+      ['id', 'parentId', 'name', 'type', 'size', 'mtime', 'version', 'sha256']);
     const out: NamespaceNode[] = [];
     while (rs.goToNextRow()) {
       out.push(this.rowToNode(rs));
@@ -178,7 +188,7 @@ export class NamespaceStore {
     const predicates = new relationalStore.RdbPredicates(TABLE);
     predicates.equalTo('parentId', 0);
     const rs = await this.store.query(predicates,
-      ['id', 'parentId', 'name', 'type', 'size', 'mtime', 'version']);
+      ['id', 'parentId', 'name', 'type', 'size', 'mtime', 'version', 'sha256']);
     let root: NamespaceNode | null = null;
     if (rs.goToNextRow()) {
       root = this.rowToNode(rs);
@@ -206,6 +216,7 @@ export class NamespaceStore {
   }
 
   private rowToNode(rs: relationalStore.ResultSet): NamespaceNode {
+    const sha: string = rs.getString(rs.getColumnIndex('sha256'));
     return {
       id: rs.getLong(rs.getColumnIndex('id')),
       parentId: rs.getLong(rs.getColumnIndex('parentId')),
@@ -214,6 +225,7 @@ export class NamespaceStore {
       size: rs.getLong(rs.getColumnIndex('size')),
       mtime: rs.getLong(rs.getColumnIndex('mtime')),
       version: rs.getLong(rs.getColumnIndex('version')),
+      sha256: sha.length > 0 ? sha : undefined,
     };
   }
 }

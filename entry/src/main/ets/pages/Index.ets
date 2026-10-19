@@ -142,7 +142,11 @@ struct Index {
       }
 
       this.regStatus = '注册中…';
-      const name: string = DeviceIdentity.generateDeviceName();
+      // P0-2：自愈重注册时复用持久化 deviceName（clear() 有意保留），首次注册才生成新名
+      let name: string = this.identity.getDeviceName();
+      if (name.length === 0) {
+        name = DeviceIdentity.generateDeviceName();
+      }
       const client = new ControlPlaneClient(this.ctrlUrl);
       const resp: RegisterResponse = await client.register(name, 'harmonyos');
       await this.identity.save(resp.deviceId, resp.deviceToken, name);

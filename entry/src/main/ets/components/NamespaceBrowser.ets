@@ -91,10 +91,13 @@ export struct NamespaceBrowser {
       const client = new ControlPlaneClient(this.ctrlUrl);
       const resp: NamespaceResponse = await client.fetchNamespace(this.deviceToken, since);
       if (resp.version < since) {
-        // P0-1：服务端版本回退（重启/重置）——禁止游标倒退，清库全量重拉
-        await this.store.resetAll(resp.nodes, resp.version);
-        this.syncMsg = `检测到服务端版本回退 v${since}→v${resp.version}，已全量重拉 `
-          + `${resp.nodes.length} 节点`;
+        // P0-1b：服务端版本回退（重启/重置）——本次增量响应的 nodes 按 version>since
+        // 过滤，回退场景下必为空，绝不可直接 resetAll（会清空本地树）。
+        // 正确链路：再发一次 since=0 全量拉取 → 清库重存 → 游标写服务端当前版本。
+        const full: NamespaceResponse = await client.fetchNamespace(this.deviceToken, 0);
+        await this.store.resetAll(full.nodes, full.version);
+        this.syncMsg = `检测到服务端版本回退 v${since}→v${full.version}，已全量重拉 `
+          + `${full.nodes.length} 节点`;
       } else {
         await this.store.applyChanges(resp.nodes, resp.version);
         this.syncMsg = `已同步（${resp.mode === 'full' ? '全量' : '增量'} `
