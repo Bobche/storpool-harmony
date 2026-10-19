@@ -1,6 +1,6 @@
 import { StorPoolViewModel } from '../viewmodel/StorPoolViewModel';
 import { Theme } from '../common/Theme';
-import { SectionHeader, LabeledRow, InfoCard } from '../common/UiKit';
+import { SectionHeader, LabeledRow } from '../common/UiKit';
 
 /**
  * H3 区块：后台长时任务保活（状态与动作全部委托 StorPoolViewModel）
@@ -19,11 +19,14 @@ export struct KeepAliveSection {
         subtitle: 'dataTransfer + 实况窗进度 + 网络监听'
       })
 
-      InfoCard({
-        content: () => {
-          this.kaInfo()
-        }
-      })
+      Column({ space: 5 }) {
+        this.kaInfo()
+      }
+      .width('100%')
+      .padding(Theme.CARD_PADDING)
+      .borderRadius(Theme.CARD_RADIUS)
+      .backgroundColor(Theme.CARD_BG)
+      .alignItems(HorizontalAlign.Start)
 
       Row({ space: 10 }) {
         Button(this.model.kaRunning ? '保活中' : '申请保活')

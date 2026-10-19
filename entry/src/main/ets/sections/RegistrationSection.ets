@@ -1,6 +1,6 @@
 import { StorPoolViewModel } from '../viewmodel/StorPoolViewModel';
 import { Theme } from '../common/Theme';
-import { SectionHeader, LabeledRow, InfoCard } from '../common/UiKit';
+import { SectionHeader, LabeledRow } from '../common/UiKit';
 
 /**
  * H1 区块：设备注册 + 控制面心跳（状态与动作全部委托 StorPoolViewModel）
@@ -28,11 +28,14 @@ export struct RegistrationSection {
       }
       .width('100%')
 
-      InfoCard({
-        content: () => {
-          this.regInfo()
-        }
-      })
+      Column({ space: 5 }) {
+        this.regInfo()
+      }
+      .width('100%')
+      .padding(Theme.CARD_PADDING)
+      .borderRadius(Theme.CARD_RADIUS)
+      .backgroundColor(Theme.CARD_BG)
+      .alignItems(HorizontalAlign.Start)
 
       Row({ space: 10 }) {
         Button(this.model.regOk ? '重新注册' : '注册')
