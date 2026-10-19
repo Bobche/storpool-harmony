@@ -3,7 +3,7 @@
 """StorPool 完整 e2e 流程脚本（P1-1，机器 C：feat/e2e-scripts）
 
 三件套分层：
-  mock-control-plane/selftest.py — 协议层：mock 端点 HTTP 语义自检（18 用例）
+  mock-control-plane/selftest.py — 协议层：mock 端点 HTTP 语义自检（24 用例）
   e2e/hapctl.py                  — 设备层：HAP 构建/安装/启动 + uitest 驱动原语
   e2e/e2e.py                     — 流程层：本文件（编排协议层 + 设备层成完整 e2e）
 
@@ -59,8 +59,8 @@ PORT = 8765
 BASE = f'http://127.0.0.1:{PORT}'
 LOG_DIR = os.path.join(HERE, 'logs')
 
-# selftest.py 18 用例（协议层，作阶段校验基准）
-SELFTEST_CASES = 18
+# selftest.py 24 用例（协议层，作阶段校验基准；a1e354e 起用例 19-24 入库）
+SELFTEST_CASES = 24
 
 
 # ============================================================
@@ -202,7 +202,7 @@ def try_start_emulator() -> bool:
 
 
 # ============================================================
-# 阶段 http：协议层自检（selftest.py 18 用例）
+# 阶段 http：协议层自检（selftest.py 24 用例）
 # ============================================================
 
 def phase_http(rep: Report) -> bool:
@@ -223,7 +223,7 @@ def phase_http(rep: Report) -> bool:
         m = re.search(r'(\d+) passed, (\d+) failed', out)
         passed, failed = (int(m.group(1)), int(m.group(2))) if m else (-1, -1)
         ok = p.returncode == 0 and failed == 0 and passed == SELFTEST_CASES
-        rep.expect('协议层自检（selftest.py 18 用例）', ok,
+        rep.expect(f'协议层自检（selftest.py {SELFTEST_CASES} 用例）', ok,
                    f'{passed} passed / {failed} failed',
                    out.strip().splitlines()[-1] if out.strip() else 'no output')
         if not ok:
