@@ -8,6 +8,7 @@
 #   ./build.sh --rust     # 仅编译 Rust + 复制 .so
 #   ./build.sh --hap      # 仅构建 HAP（需先有 .so）
 #   ./build.sh --clean    # 清理 Rust target 后重新编译
+#   ./build.sh --check    # OpenAPI 契约一致性检查（tools/contract_check.py，fail → 非零退出）
 #
 # 前置依赖：
 #   - Rust 工具链 + ohos 目标（rustup target add aarch64-unknown-linux-ohos x86_64-unknown-linux-ohos）
@@ -249,6 +250,29 @@ clean_rust() {
     log_info "  ✓ 清理完成"
 }
 
+# ---- OpenAPI 契约一致性检查（round 5） ----
+# 定位仓库根（build.sh 所在目录）后调用 tools/contract_check.py，
+# 透传其退出码：15/15 PASS → 0；任一 FAIL → 非零（set -e 下脚本以非零退出）。
+# 独立子命令，不触碰 Rust/HAP 构建路径（check_env/build_rust/build_hap 均不调用）。
+run_contract_check() {
+    log_info "OpenAPI 契约一致性检查（tools/contract_check.py）..."
+
+    if ! command -v python &>/dev/null; then
+        log_error "python 未找到。请安装 Python 3.12+（仅 stdlib 依赖）"
+        exit 1
+    fi
+
+    # 定位仓库根：SCRIPT_DIR 即 build.sh 所在目录（仓库根）
+    local check_script="${SCRIPT_DIR}/tools/contract_check.py"
+    if [[ ! -f "${check_script}" ]]; then
+        log_error "contract_check.py 未找到: ${check_script}"
+        exit 1
+    fi
+
+    # 透传退出码（contract_check 内部 fail → sys.exit(1)）
+    python "${check_script}"
+}
+
 # ---- 主流程 ----
 main() {
     local mode="${1:-all}"
@@ -267,13 +291,16 @@ main() {
             build_rust
             build_hap
             ;;
+        --check)
+            run_contract_check
+            ;;
         all|"")
             check_env
             build_rust
             build_hap
             ;;
         *)
-            echo "用法: $0 [--rust|--hap|--clean]"
+            echo "用法: $0 [--rust|--hap|--clean|--check]"
             exit 1
             ;;
     esac
