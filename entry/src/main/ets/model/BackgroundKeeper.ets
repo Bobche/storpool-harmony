@@ -5,6 +5,14 @@ import { connection } from '@kit.NetworkKit';
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 
+/** P1-7：保活操作结构化结果（替代原 "OK:<id>"/"FAIL:<code>" 字符串协议） */
+export interface KeepAliveResult {
+  ok: boolean;
+  notificationId: number; // 成功时的系统通知 id；失败/未启动为 -1
+  errorCode: number;      // 失败时的 BusinessError code；成功为 0
+  errorMessage: string;   // 失败原因描述；成功为空
+}
+
 /** H3 后台长时任务保活：dataTransfer 长时任务 + 实况窗进度通知 + 网络状态监听 */
 export class BackgroundKeeper {
   private notificationId: number = -1;
@@ -21,10 +29,11 @@ export class BackgroundKeeper {
     return this.notificationId;
   }
 
-  /** 申请 dataTransfer 长时任务；返回 "OK:<notificationId>" 或 "FAIL:<code>" */
-  async startKeepAlive(context: common.UIAbilityContext, onNetChange: (online: boolean) => void): Promise<string> {
+  /** 申请 dataTransfer 长时任务 */
+  async startKeepAlive(context: common.UIAbilityContext, onNetChange: (online: boolean) => void): Promise<KeepAliveResult> {
     if (this.running) {
-      return 'OK:' + this.notificationId;
+      const dup: KeepAliveResult = { ok: true, notificationId: this.notificationId, errorCode: 0, errorMessage: '' };
+      return dup;
     }
     try {
       const info: wantAgent.WantAgentInfo = {
@@ -42,27 +51,36 @@ export class BackgroundKeeper {
       this.notificationId = res.notificationId;
       this.running = true;
       this.startNetWatch(onNetChange);
-      return 'OK:' + this.notificationId;
+      const ok: KeepAliveResult = { ok: true, notificationId: this.notificationId, errorCode: 0, errorMessage: '' };
+      return ok;
     } catch (e) {
       const err = e as BusinessError;
-      return 'FAIL:' + (err.code ?? -1) + ':' + err.message;
+      const fail: KeepAliveResult = {
+        ok: false, notificationId: -1, errorCode: err.code ?? -1, errorMessage: err.message ?? ''
+      };
+      return fail;
     }
   }
 
-  /** 停止长时任务；返回 "OK" 或 "FAIL:<code>" */
-  async stopKeepAlive(context: common.UIAbilityContext): Promise<string> {
+  /** 停止长时任务 */
+  async stopKeepAlive(context: common.UIAbilityContext): Promise<KeepAliveResult> {
     if (!this.running) {
-      return 'OK';
+      const idle: KeepAliveResult = { ok: true, notificationId: -1, errorCode: 0, errorMessage: '' };
+      return idle;
     }
     try {
       await backgroundTaskManager.stopBackgroundRunning(context);
       this.running = false;
       this.notificationId = -1;
       this.stopNetWatch();
-      return 'OK';
+      const ok: KeepAliveResult = { ok: true, notificationId: -1, errorCode: 0, errorMessage: '' };
+      return ok;
     } catch (e) {
       const err = e as BusinessError;
-      return 'FAIL:' + (err.code ?? -1) + ':' + err.message;
+      const fail: KeepAliveResult = {
+        ok: false, notificationId: this.notificationId, errorCode: err.code ?? -1, errorMessage: err.message ?? ''
+      };
+      return fail;
     }
   }
 

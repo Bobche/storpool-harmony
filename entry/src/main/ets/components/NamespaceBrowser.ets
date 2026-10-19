@@ -2,6 +2,9 @@ import { NamespaceNode, ControlPlaneClient, NamespaceResponse, HttpError } from 
 import { NamespaceStore, NamespaceStat } from '../model/NamespaceStore';
 import { ChunkedDownloader, DownloadProgress, DownloadResult } from '../model/ChunkedDownloader';
 import keeper from '../model/backgroundKeeperInstance';
+import { StorPoolViewModel } from '../viewmodel/StorPoolViewModel';
+import { Theme } from '../common/Theme';
+import { fmtSize } from '../common/Format';
 import { common } from '@kit.AbilityKit';
 
 /**
@@ -10,6 +13,9 @@ import { common } from '@kit.AbilityKit';
  * 职责：拉取（全量/增量）→ SQLite 缓存 → 面包屑 + 列表浏览
  *       文件项分片下载（H4：Range GET → 重组 → sha256 校验 → 落盘 filesDir/downloads）
  * 数据流：控制面 GET /namespace?since=游标 → upsert namespace 表 → 本地查询渲染
+ * P1-7：ctrlUrl/deviceToken/registered 三个单向 @Prop + onAuthLost 回调收敛为
+ * @ObjectLink model（同一 @Observed 状态源，401 自愈直接 model.selfHeal）；
+ * 色值引用 Theme；「已同步/✅」字符串前缀判色改布尔位。UI 文案逐字保留（e2e 依赖）。
  */
 class Crumb {
   id: number = 0;
@@ -23,12 +29,11 @@ class Crumb {
 
 @Component
 export struct NamespaceBrowser {
-  @Prop ctrlUrl: string = '';
-  @Prop deviceToken: string = '';
-  @Prop registered: boolean = false;
+  @ObjectLink model: StorPoolViewModel;
 
   @State syncing: boolean = false;
   @State syncMsg: string = '未同步';
+  @State syncOk: boolean = false;
   @State statLine: string = '';
   @State crumbs: Crumb[] = [];
   @State entries: NamespaceNode[] = [];
@@ -39,20 +44,11 @@ export struct NamespaceBrowser {
   @State dlPercent: number = 0;
   @State dlDetail: string = '';
   @State dlMsg: string = '';
+  @State dlOk: boolean = false;
 
   private store: NamespaceStore = new NamespaceStore();
   private storeReady: boolean = false;
   private downloader: ChunkedDownloader | null = null;
-
-  private static fmtSize(bytes: number): string {
-    if (bytes < 1024) {
-      return `${bytes} B`;
-    }
-    if (bytes < 1048576) {
-      return `${(bytes / 1024).toFixed(1)} KB`;
-    }
-    return `${(bytes / 1048576).toFixed(1)} MB`;
-  }
 
   private async ensureStore(): Promise<boolean> {
     if (this.storeReady) {
@@ -62,6 +58,7 @@ export struct NamespaceBrowser {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       if (ctx === undefined) {
         this.syncMsg = '获取 Context 失败';
+        this.syncOk = false;
         return false;
       }
       await this.store.init(ctx);
@@ -69,17 +66,16 @@ export struct NamespaceBrowser {
       return true;
     } catch (e) {
       this.syncMsg = `SQLite 初始化失败: ${e}`;
+      this.syncOk = false;
       return false;
     }
   }
 
-  /** P0-2：身份失效（401）回调——通知宿主页面自愈（清身份→重注册→恢复心跳） */
-  onAuthLost?: () => void;
-
   /** 同步：首次全量（since=0），此后按游标增量（P0-1：含墓碑删除与版本回退保护） */
   async sync(): Promise<void> {
-    if (!this.registered || this.deviceToken.length === 0) {
+    if (!this.model.regOk || this.model.deviceToken.length === 0) {
       this.syncMsg = '请先注册设备';
+      this.syncOk = false;
       return;
     }
     if (!(await this.ensureStore())) {
@@ -88,32 +84,34 @@ export struct NamespaceBrowser {
     this.syncing = true;
     try {
       const since: number = await this.store.getSyncedVersion();
-      const client = new ControlPlaneClient(this.ctrlUrl);
-      const resp: NamespaceResponse = await client.fetchNamespace(this.deviceToken, since);
+      const client = new ControlPlaneClient(this.model.ctrlUrl);
+      const resp: NamespaceResponse = await client.fetchNamespace(this.model.deviceToken, since);
       if (resp.version < since) {
         // P0-1b：服务端版本回退（重启/重置）——本次增量响应的 nodes 按 version>since
         // 过滤，回退场景下必为空，绝不可直接 resetAll（会清空本地树）。
         // 正确链路：再发一次 since=0 全量拉取 → 清库重存 → 游标写服务端当前版本。
-        const full: NamespaceResponse = await client.fetchNamespace(this.deviceToken, 0);
+        const full: NamespaceResponse = await client.fetchNamespace(this.model.deviceToken, 0);
         await this.store.resetAll(full.nodes, full.version);
         this.syncMsg = `检测到服务端版本回退 v${since}→v${full.version}，已全量重拉 `
           + `${full.nodes.length} 节点`;
+        this.syncOk = false; // 回退属异常事件，保持中性色（与拆前一致）
       } else {
         await this.store.applyChanges(resp.nodes, resp.version);
         this.syncMsg = `已同步（${resp.mode === 'full' ? '全量' : '增量'} `
           + `${resp.nodes.length} 节点，v${since}→v${resp.version}）`;
+        this.syncOk = true;
       }
       await this.refreshStat();
       await this.refreshRoot();
     } catch (e) {
       if (e instanceof HttpError && e.statusCode === 401) {
-        // P0-2：token 失效（mock 重启内存丢失/服务端重置）→ 通知宿主自愈
+        // P0-2：token 失效（mock 重启内存丢失/服务端重置）→ 直接触发宿主自愈
         this.syncMsg = '身份失效（401），已触发自动重注册';
-        if (this.onAuthLost !== undefined) {
-          this.onAuthLost();
-        }
+        this.syncOk = false;
+        this.model.selfHeal('namespace');
       } else {
         this.syncMsg = `同步失败: ${e}`;
+        this.syncOk = false;
       }
     }
     this.syncing = false;
@@ -123,15 +121,18 @@ export struct NamespaceBrowser {
   async startDownload(node: NamespaceNode): Promise<void> {
     if (this.dlRunning) {
       this.dlMsg = '已有下载进行中，请稍候';
+      this.dlOk = false;
       return;
     }
-    if (!this.registered || this.deviceToken.length === 0) {
+    if (!this.model.regOk || this.model.deviceToken.length === 0) {
       this.dlMsg = '设备未注册，无法下载';
+      this.dlOk = false;
       return;
     }
     const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
     if (ctx === undefined) {
       this.dlMsg = '获取 Context 失败';
+      this.dlOk = false;
       return;
     }
     this.dlRunning = true;
@@ -139,7 +140,7 @@ export struct NamespaceBrowser {
     this.dlPercent = 0;
     this.dlDetail = '';
     this.dlMsg = '';
-    const downloader = new ChunkedDownloader(this.ctrlUrl, this.deviceToken);
+    const downloader = new ChunkedDownloader(this.model.ctrlUrl, this.model.deviceToken);
     this.downloader = downloader;
     try {
       const destDir: string = `${ctx.filesDir}/downloads`;
@@ -152,15 +153,15 @@ export struct NamespaceBrowser {
       const result: DownloadResult = await downloader.download(node, destDir, onProgress);
       this.dlMsg = `✅ ${node.name} 已下载（${result.receivedBytes}B，sha256 校验`
         + `${result.verified ? '通过' : '跳过'}，${result.durationMs}ms）→ ${result.filePath}`;
+      this.dlOk = true;
     } catch (e) {
       if (e instanceof HttpError && e.statusCode === 401) {
         this.dlMsg = '❌ 下载失败：身份失效（401），已触发自动重注册';
-        if (this.onAuthLost !== undefined) {
-          this.onAuthLost();
-        }
+        this.model.selfHeal('namespace');
       } else {
         this.dlMsg = `❌ 下载失败: ${e}`;
       }
+      this.dlOk = false;
     }
     this.dlRunning = false;
     this.downloader = null;
@@ -170,7 +171,7 @@ export struct NamespaceBrowser {
     try {
       const s: NamespaceStat = await this.store.stat();
       this.statLine = `${s.totalNodes} 节点 · ${s.fileCount} 文件 · `
-        + `${NamespaceBrowser.fmtSize(s.totalSize)}`;
+        + `${fmtSize(s.totalSize)}`;
     } catch (e) {
       this.statLine = '';
     }
@@ -214,8 +215,8 @@ export struct NamespaceBrowser {
     Column({ space: 8 }) {
       Row({ space: 8 }) {
         Text(this.syncMsg)
-          .fontSize(12)
-          .fontColor(this.syncMsg.startsWith('已同步') ? '#2E7D32' : '#666666')
+          .fontSize(Theme.SMALL_SIZE)
+          .fontColor(this.syncOk ? Theme.SUCCESS : Theme.TEXT_LABEL)
           .layoutWeight(1)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -223,15 +224,15 @@ export struct NamespaceBrowser {
           LoadingProgress().width(20).height(20)
         }
         Button('同步目录树')
-          .fontSize(12)
-          .height(32)
-          .enabled(this.registered && !this.syncing)
+          .fontSize(Theme.SMALL_SIZE)
+          .height(Theme.BTN_HEIGHT_SMALL)
+          .enabled(this.model.regOk && !this.syncing)
           .onClick(() => this.sync())
       }
       .width('100%')
 
       if (this.statLine.length > 0) {
-        Text(this.statLine).fontSize(11).fontColor('#888888')
+        Text(this.statLine).fontSize(Theme.SUBTITLE_SIZE).fontColor(Theme.TEXT_HINT)
       }
 
       // 面包屑
@@ -241,11 +242,11 @@ export struct NamespaceBrowser {
             ForEach(this.crumbs, (c: Crumb, idx?: number) => {
               Row({ space: 4 }) {
                 Text(c.name.length > 0 ? c.name : '/')
-                  .fontSize(12)
-                  .fontColor(idx === this.crumbs.length - 1 ? '#333333' : '#1976D2')
+                  .fontSize(Theme.SMALL_SIZE)
+                  .fontColor(idx === this.crumbs.length - 1 ? Theme.TEXT_PRIMARY : Theme.LINK)
                   .onClick(() => this.jumpTo(idx as number))
                 if (idx !== undefined && idx < this.crumbs.length - 1) {
-                  Text('›').fontSize(12).fontColor('#AAAAAA')
+                  Text('›').fontSize(Theme.SMALL_SIZE).fontColor(Theme.TEXT_PLACEHOLDER)
                 }
               }
             }, (c: Crumb, idx?: number) => `${c.id}-${idx}`)
@@ -264,24 +265,24 @@ export struct NamespaceBrowser {
               Row({ space: 8 }) {
                 Text(n.type === 'dir' ? '📁' : '📄').fontSize(16)
                 Text(n.name.length > 0 ? n.name : '/')
-                  .fontSize(13)
+                  .fontSize(Theme.BODY_SIZE)
                   .layoutWeight(1)
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
                 if (n.type === 'dir') {
-                  Text('›').fontSize(16).fontColor('#AAAAAA')
+                  Text('›').fontSize(16).fontColor(Theme.TEXT_PLACEHOLDER)
                 } else {
-                  Text(NamespaceBrowser.fmtSize(n.size))
-                    .fontSize(11)
-                    .fontColor('#888888')
+                  Text(fmtSize(n.size))
+                    .fontSize(Theme.SUBTITLE_SIZE)
+                    .fontColor(Theme.TEXT_HINT)
                   // H4：分片下载入口（下载中禁用）
                   Button(this.dlRunning && this.dlName === n.name ? '…' : '⬇')
-                    .fontSize(12)
+                    .fontSize(Theme.SMALL_SIZE)
                     .height(28)
                     .width(36)
                     .padding(0)
-                    .backgroundColor(this.dlRunning && this.dlName === n.name ? '#9E9E9E' : '#42A5F5')
-                    .enabled(this.registered && !this.dlRunning)
+                    .backgroundColor(this.dlRunning && this.dlName === n.name ? Theme.BTN_DISABLED : Theme.BTN_DOWNLOAD)
+                    .enabled(this.model.regOk && !this.dlRunning)
                     .onClick(() => {
                       this.startDownload(n);
                     })
@@ -289,8 +290,8 @@ export struct NamespaceBrowser {
               }
               .width('100%')
               .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-              .borderRadius(8)
-              .backgroundColor('#FAFAFA')
+              .borderRadius(Theme.CARD_RADIUS)
+              .backgroundColor(Theme.ENTRY_BG)
               .onClick(() => {
                 if (n.type === 'dir') {
                   this.enterDir(n);
@@ -303,7 +304,7 @@ export struct NamespaceBrowser {
         .height(220)
         .scrollBar(BarState.Auto)
       } else if (this.statLine.length > 0) {
-        Text('（空目录）').fontSize(12).fontColor('#AAAAAA')
+        Text('（空目录）').fontSize(Theme.SMALL_SIZE).fontColor(Theme.TEXT_PLACEHOLDER)
       }
 
       // H4：下载进度区块（下载中展示进度条；结果消息常驻展示）
@@ -312,27 +313,27 @@ export struct NamespaceBrowser {
           if (this.dlRunning) {
             Row({ space: 8 }) {
               Text(this.dlName)
-                .fontSize(12)
+                .fontSize(Theme.SMALL_SIZE)
                 .layoutWeight(1)
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
               Text(`${this.dlPercent}%`)
-                .fontSize(12)
-                .fontColor('#1976D2')
+                .fontSize(Theme.SMALL_SIZE)
+                .fontColor(Theme.LINK)
             }
             .width('100%')
             Progress({ value: this.dlPercent, total: 100, type: ProgressType.Linear })
               .width('100%')
             Text(this.dlDetail)
-              .fontSize(10)
-              .fontColor('#888888')
+              .fontSize(Theme.TINY_SIZE)
+              .fontColor(Theme.TEXT_HINT)
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
           if (this.dlMsg.length > 0) {
             Text(this.dlMsg)
-              .fontSize(11)
-              .fontColor(this.dlMsg.startsWith('✅') ? '#2E7D32' : '#C62828')
+              .fontSize(Theme.SUBTITLE_SIZE)
+              .fontColor(this.dlOk ? Theme.SUCCESS : Theme.DANGER)
               .maxLines(2)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
@@ -340,20 +341,20 @@ export struct NamespaceBrowser {
         .width('100%')
         .padding(8)
         .borderRadius(6)
-        .backgroundColor('#FFFFFF')
+        .backgroundColor(Theme.DOWNLOAD_BOX_BG)
         .alignItems(HorizontalAlign.Start)
       }
 
-      if (!this.registered) {
+      if (!this.model.regOk) {
         Text('设备未注册，无法同步（先完成上方 H1 注册）')
-          .fontSize(11)
-          .fontColor('#C62828')
+          .fontSize(Theme.SUBTITLE_SIZE)
+          .fontColor(Theme.DANGER)
       }
     }
     .width('100%')
-    .padding(10)
-    .borderRadius(8)
-    .backgroundColor('#F5F5F5')
+    .padding(Theme.CARD_PADDING)
+    .borderRadius(Theme.CARD_RADIUS)
+    .backgroundColor(Theme.CARD_BG)
     .alignItems(HorizontalAlign.Start)
   }
 }
